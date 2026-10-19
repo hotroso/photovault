@@ -145,7 +145,7 @@ func (h *Handler) uploadAssemble(w http.ResponseWriter, r *http.Request, rel str
 	// Dọn thư mục chunk tạm.
 	_ = h.store.Remove(chunkDirRel(uuidRel))
 
-	res, _, err := h.storeWithDedup(r.Context(), staged, filepath.Base(dest), mtime)
+	res, _, err := h.storeWithDedup(r.Context(), staged, filepath.Base(dest), mtime, dest)
 	if err != nil {
 		h.logger.Error("lưu file ghép lỗi", "dest", dest, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -118,48 +117,79 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, rel string) {
 		XMLNSNC: "http://nextcloud.org/ns",
 	}
 
-	fi, abs, err := h.store.Stat(rel)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// M1 — WebDAV ảo: không gian files/<user>/... không ánh xạ 1-1 với
-			// đĩa (file thật nằm ở photos/<yyyymm>/). App Nextcloud PROPFIND thư
-			// mục đích (vd files/me, files/me/InstantUpload) trước khi upload;
-			// nếu trả 404 app sẽ coi server không hợp lệ và KHÔNG upload. Vì vậy
-			// mọi đường dẫn chưa có trên đĩa trong không gian này được coi là một
-			// collection ẢO rỗng (207) để app yên tâm đẩy ảnh lên.
-			ms.Responses = append(ms.Responses, virtualDirResponse(r.URL.Path))
-			writeMultistatus(w, h.logger, ms)
-			return
-		}
-		h.logger.Error("PROPFIND stat lỗi", "rel", rel, "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	ctx := r.Context()
+
+	// M2 — ánh xạ hai chiều: cây thư mục trả cho app được dựng từ logical_path
+	// trong DB, KHÔNG đọc cây thư mục vật lý (file thật nằm ở photos/<yyyymm>/).
+
+	// (1) rel trỏ tới một FILE đã upload? → trả metadata thật của file đó.
+	if ph, err := h.pg.GetByLogicalPath(ctx, rel); err == nil && ph != nil {
+		ms.Responses = append(ms.Responses, h.responseForPhoto(r.URL.Path, ph))
+		writeMultistatus(w, h.logger, ms)
 		return
 	}
 
-	ms.Responses = append(ms.Responses, h.responseFor(r.URL.Path, fi))
+	// (2) rel là một THƯ MỤC: trả chính nó + (nếu Depth≥1) các con trực tiếp.
+	ms.Responses = append(ms.Responses, dirResponse(r.URL.Path))
 
-	// Depth 1 trên thư mục: liệt kê các con.
-	if fi.IsDir() && depth != "0" {
-		entries, err := os.ReadDir(abs)
-		if err == nil {
-			for _, e := range entries {
-				if strings.HasSuffix(e.Name(), ".part") {
-					continue // bỏ qua file đang ghi dở
-				}
-				cfi, cerr := e.Info()
-				if cerr != nil {
-					continue
-				}
-				childURL := path.Join(r.URL.Path, e.Name())
-				if cfi.IsDir() {
-					childURL += "/"
-				}
-				ms.Responses = append(ms.Responses, h.responseFor(childURL, cfi))
+	if depth != "0" {
+		prefix := strings.TrimSuffix(rel, "/") + "/"
+		children, err := h.pg.ListByLogicalPrefix(ctx, prefix, 10000)
+		if err != nil {
+			h.logger.Warn("PROPFIND liệt kê con lỗi", "rel", rel, "err", err)
+		}
+		for _, c := range immediateChildren(rel, children) {
+			childURL := path.Join(r.URL.Path, c.name)
+			if c.isDir {
+				childURL += "/"
+				ms.Responses = append(ms.Responses, dirResponse(childURL))
+			} else {
+				ms.Responses = append(ms.Responses, h.responseForPhoto(childURL, c.photo))
 			}
 		}
 	}
 
 	writeMultistatus(w, h.logger, ms)
+}
+
+// childEntry là một mục con trực tiếp của thư mục logic đang PROPFIND.
+type childEntry struct {
+	name  string
+	isDir bool
+	photo *store.Photo // chỉ có khi isDir=false
+}
+
+// immediateChildren rút các con TRỰC TIẾP của thư mục logic dir từ danh sách ảnh
+// có logical_path bắt đầu bằng "dir/". Mỗi logical_path "dir/<seg>/..." với phần
+// còn lại nhiều segment → sinh một thư mục con "<seg>" (gộp trùng); nếu phần còn
+// lại đúng một segment → là file "<seg>".
+func immediateChildren(dir string, photos []store.Photo) []childEntry {
+	dir = strings.TrimSuffix(dir, "/")
+	prefix := dir + "/"
+	seenDir := map[string]bool{}
+	var out []childEntry
+	for i := range photos {
+		lp := photos[i].LogicalPath
+		if !strings.HasPrefix(lp, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(lp, prefix)
+		if rest == "" {
+			continue
+		}
+		if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+			// Còn nhiều segment → con là một thư mục trung gian.
+			seg := rest[:idx]
+			if seg != "" && !seenDir[seg] {
+				seenDir[seg] = true
+				out = append(out, childEntry{name: seg, isDir: true})
+			}
+		} else {
+			// Đúng một segment → là file.
+			out = append(out, childEntry{name: rest, isDir: false, photo: &photos[i]})
+		}
+	}
+	return out
 }
 
 // writeMultistatus phát 207 Multi-Status kèm body XML.
@@ -173,46 +203,48 @@ func writeMultistatus(w http.ResponseWriter, logger *slog.Logger, ms multistatus
 	}
 }
 
-// virtualDirResponse tạo một entry collection ẢO (không có file vật lý) cho
-// PROPFIND trong không gian files/<user>/... — dùng cho M1 (xem ghi chú ở propfind).
-func virtualDirResponse(href string) davResponse {
+// dirResponse tạo một entry collection (thư mục) cho PROPFIND. Thư mục trong
+// không gian files/<user>/... là ẢO — dựng từ logical_path trong DB, không cần
+// thư mục vật lý. Nếu DB chưa có gì khớp, đây vẫn là collection rỗng hợp lệ (M1)
+// để app chấp nhận thư mục đích trước khi upload.
+func dirResponse(href string) davResponse {
 	return davResponse{
 		Href: href,
 		Propstat: davPropstat{
 			Prop: davProp{
 				ResourceType: &resourceType{Collection: &struct{}{}},
 				LastModified: time.Now().UTC().Format(http.TimeFormat),
-				ETag:         fmt.Sprintf("%q", "virtual"),
+				ETag:         fmt.Sprintf("%q", "dir"),
 			},
 			Status: "HTTP/1.1 200 OK",
 		},
 	}
 }
 
-func (h *Handler) responseFor(href string, fi os.FileInfo) davResponse {
-	prop := davProp{
-		LastModified: fi.ModTime().UTC().Format(http.TimeFormat),
-		ETag:         fmt.Sprintf("%q", etagOf(fi)),
-	}
-	if fi.IsDir() {
-		prop.ResourceType = &resourceType{Collection: &struct{}{}}
-	} else {
-		prop.ResourceType = &resourceType{}
-		size := fi.Size()
-		prop.ContentLength = &size
-		prop.ContentType = contentTypeByExt(fi.Name())
-	}
+// responseForPhoto dựng davResponse cho một file từ bản ghi DB (không stat đĩa).
+func (h *Handler) responseForPhoto(href string, ph *store.Photo) davResponse {
+	size := ph.Size
 	return davResponse{
 		Href: href,
 		Propstat: davPropstat{
-			Prop:   prop,
+			Prop: davProp{
+				ResourceType:  &resourceType{},
+				ContentLength: &size,
+				ContentType:   ph.MIME,
+				LastModified:  ph.TakenAt.UTC().Format(http.TimeFormat),
+				ETag:          fmt.Sprintf("%q", etagOfHash(ph.SHA256)),
+			},
 			Status: "HTTP/1.1 200 OK",
 		},
 	}
 }
 
-func etagOf(fi os.FileInfo) string {
-	return fmt.Sprintf("%x-%x", fi.ModTime().UnixNano(), fi.Size())
+// etagOfHash tạo ETag ổn định từ sha256 (16 ký tự đầu là đủ phân biệt).
+func etagOfHash(sha string) string {
+	if len(sha) >= 16 {
+		return sha[:16]
+	}
+	return sha
 }
 
 // ---- MKCOL ----
@@ -241,7 +273,7 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 		return
 	}
 
-	res, _, err := h.storeWithDedup(r.Context(), staged, path.Base(rel), mtime)
+	res, _, err := h.storeWithDedup(r.Context(), staged, path.Base(rel), mtime, rel)
 	if err != nil {
 		// storeWithDedup đã RemoveStaged ở nhánh lỗi finalize.
 		h.logger.Error("PUT lưu lỗi", "rel", rel, "err", err)
@@ -259,7 +291,7 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 // đưa vào photos/ (bản gốc) hay recyclebin/ (bản trùng, is_trash=true, dup_of=gốc).
 // Luôn trả về *Result khi không lỗi; dup=true nếu là bản trùng. Dù dedup hay
 // không, một lỗi DB tra cứu KHÔNG bao giờ chặn backup — khi đó coi như không trùng.
-func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResult, baseName string, mtime time.Time) (*storage.Result, bool, error) {
+func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResult, baseName string, mtime time.Time, logicalPath string) (*storage.Result, bool, error) {
 	existing, err := h.pg.GetBySHA256(ctx, staged.SHA256)
 	if err != nil {
 		h.logger.Warn("tra cứu hash thất bại, coi như không trùng", "hash", staged.SHA256[:12], "err", err)
@@ -273,7 +305,7 @@ func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResul
 			return nil, false, ferr
 		}
 		dupOf := existing.ID
-		h.indexPhoto(ctx, res, mtime, true, &dupOf)
+		h.indexPhoto(ctx, res, mtime, true, &dupOf, logicalPath)
 		h.logger.Warn("phát hiện trùng → đưa vào thùng rác", "hash", staged.SHA256[:12], "rel", res.RelPath, "gốc", existing.RelPath)
 		return res, true, nil
 	}
@@ -283,7 +315,7 @@ func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResul
 		_ = h.store.RemoveStaged(staged.TempRel)
 		return nil, false, ferr
 	}
-	h.indexPhoto(ctx, res, mtime, false, nil)
+	h.indexPhoto(ctx, res, mtime, false, nil, logicalPath)
 	return res, false, nil
 }
 
@@ -295,30 +327,42 @@ func (h *Handler) move(w http.ResponseWriter, r *http.Request, rel string) {
 		http.Error(w, "thiếu Destination", http.StatusBadRequest)
 		return
 	}
-	if _, _, err := h.store.Stat(rel); err != nil {
-		http.Error(w, "Not Found", http.StatusNotFound)
+	ctx := r.Context()
+
+	// M2: MOVE theo đường dẫn logic. File vật lý nằm ở photos/<yyyymm>/ theo ngày
+	// gốc, ĐỘC LẬP với tên/thư mục logic, nên đổi tên/di chuyển trong không gian
+	// app CHỈ cần cập nhật ánh xạ logic (logical_path + original_name) — không
+	// động tới file trên đĩa. Giữ nguyên nguyên tắc file-là-nguồn-chân-lý.
+	if ph, err := h.pg.GetByLogicalPath(ctx, rel); err == nil && ph != nil {
+		if uerr := h.pg.UpdateLogicalPath(ctx, ph.RelPath, dest, path.Base(dest)); uerr != nil {
+			h.logger.Warn("MOVE cập nhật ánh xạ logic lỗi", "rel", rel, "dest", dest, "err", uerr)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent) // 204
 		return
 	}
-	// Dùng rename qua storage: mở nguồn, ghi đích atomic rồi xoá nguồn.
-	f, err := h.store.Open(rel)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	defer f.Close()
-	res, err := h.store.WriteAtomic(dest, f, -1, time.Time{})
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	_ = h.store.Remove(rel)
-	h.indexPhoto(r.Context(), res, time.Time{}, false, nil)
-	w.WriteHeader(http.StatusNoContent) // 204
+
+	http.Error(w, "Not Found", http.StatusNotFound)
 }
 
 // ---- DELETE ----
 
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request, rel string) {
+	ctx := r.Context()
+	// M2: DELETE theo đường dẫn logic. Tra DB → xoá file vật lý + bản ghi.
+	if ph, err := h.pg.GetByLogicalPath(ctx, rel); err == nil && ph != nil {
+		if rerr := h.store.Remove(ph.RelPath); rerr != nil {
+			h.logger.Warn("xoá file vật lý lỗi", "rel", ph.RelPath, "err", rerr)
+		}
+		if derr := h.pg.DeletePhotoByRelPath(ctx, ph.RelPath); derr != nil {
+			h.logger.Warn("xoá bản ghi lỗi", "rel", ph.RelPath, "err", derr)
+		}
+		w.WriteHeader(http.StatusNoContent) // 204
+		return
+	}
+
+	// Fallback: không có ánh xạ logic → thử xoá theo đường dẫn vật lý như cũ.
 	if err := h.store.Remove(rel); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -329,12 +373,19 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request, rel string) {
 // ---- GET / HEAD ----
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request, rel string) {
-	fi, _, err := h.store.Stat(rel)
+	// M2: ánh xạ logic → vật lý. Tra DB theo logical_path để tìm file vật lý thật
+	// (photos/<yyyymm>/...), vì đường dẫn app dùng khác đường dẫn trên đĩa.
+	physRel := rel
+	if ph, err := h.pg.GetByLogicalPath(r.Context(), rel); err == nil && ph != nil {
+		physRel = ph.RelPath
+	}
+
+	fi, _, err := h.store.Stat(physRel)
 	if err != nil || fi.IsDir() {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
-	f, err := h.store.Open(rel)
+	f, err := h.store.Open(physRel)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -350,20 +401,28 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request, rel string) {
 
 // indexPhoto ghi bản ghi vào Postgres (no-op nếu PG chưa cấu hình).
 // isTrash/dupOf đánh dấu bản trùng đã bị đưa vào thùng rác.
-func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime time.Time, isTrash bool, dupOf *int64) {
+// logicalPath là đường dẫn app nhìn thấy (M2), ví dụ "me/Photos/IMG_0001.jpg".
+func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime time.Time, isTrash bool, dupOf *int64, logicalPath string) {
 	taken := mtime
 	if taken.IsZero() {
 		taken = time.Now()
 	}
+	// original_name lấy từ tên trong đường dẫn logic (tên app đặt), không phải
+	// tên vật lý (có thể bị thêm hậu tố hash chống trùng).
+	origName := path.Base(res.RelPath)
+	if logicalPath != "" {
+		origName = path.Base(logicalPath)
+	}
 	ph := store.Photo{
 		RelPath:      res.RelPath,
-		OriginalName: path.Base(res.RelPath),
+		OriginalName: origName,
 		Size:         res.Size,
 		SHA256:       res.SHA256,
 		TakenAt:      taken,
 		MIME:         contentTypeByExt(res.RelPath),
 		IsTrash:      isTrash,
 		DupOf:        dupOf,
+		LogicalPath:  logicalPath,
 	}
 	if err := h.pg.UpsertPhoto(ctx, ph); err != nil {
 		h.logger.Warn("index Postgres thất bại", "rel", res.RelPath, "err", err)

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,6 +27,7 @@ type Photo struct {
 	UploadedAt   time.Time
 	IsTrash      bool   // true nếu nằm trong thùng rác (recyclebin/) do trùng file
 	DupOf        *int64 // ID bản gốc mà file này trùng (nil nếu là bản gốc)
+	LogicalPath  string // M2: đường dẫn app nhìn thấy, ví dụ "me/Photos/IMG_0001.jpg"
 }
 
 // Postgres bọc connection pool và các thao tác chỉ mục.
@@ -83,6 +85,11 @@ CREATE INDEX IF NOT EXISTS photos_taken_at_idx ON photos (taken_at DESC);
 ALTER TABLE photos ADD COLUMN IF NOT EXISTS is_trash BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE photos ADD COLUMN IF NOT EXISTS dup_of BIGINT;
 CREATE INDEX IF NOT EXISTS photos_sha256_idx ON photos (sha256);
+-- M2: đường dẫn logic app nhìn thấy (vd "me/Photos/x.jpg"), tách khỏi đường dẫn
+-- vật lý rel_path ("photos/<yyyymm>/x.jpg"). Dùng để PROPFIND liệt kê lại cây
+-- thư mục mà app đã upload. Index phục vụ tra cứu theo tiền tố thư mục.
+ALTER TABLE photos ADD COLUMN IF NOT EXISTS logical_path TEXT;
+CREATE INDEX IF NOT EXISTS photos_logical_path_idx ON photos (logical_path);
 `
 	_, err := p.pool.Exec(ctx, schema)
 	return err
@@ -94,8 +101,8 @@ func (p *Postgres) UpsertPhoto(ctx context.Context, ph Photo) error {
 		return nil
 	}
 	const q = `
-INSERT INTO photos (rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+INSERT INTO photos (rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, logical_path, uploaded_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
 ON CONFLICT (rel_path) DO UPDATE SET
     original_name = EXCLUDED.original_name,
     size          = EXCLUDED.size,
@@ -104,9 +111,10 @@ ON CONFLICT (rel_path) DO UPDATE SET
     mime          = EXCLUDED.mime,
     is_trash      = EXCLUDED.is_trash,
     dup_of        = EXCLUDED.dup_of,
+    logical_path  = EXCLUDED.logical_path,
     uploaded_at   = now();
 `
-	_, err := p.pool.Exec(ctx, q, ph.RelPath, ph.OriginalName, ph.Size, ph.SHA256, ph.TakenAt, ph.MIME, ph.IsTrash, ph.DupOf)
+	_, err := p.pool.Exec(ctx, q, ph.RelPath, ph.OriginalName, ph.Size, ph.SHA256, ph.TakenAt, ph.MIME, ph.IsTrash, ph.DupOf, ph.LogicalPath)
 	return err
 }
 
@@ -116,12 +124,12 @@ func (p *Postgres) GetByRelPath(ctx context.Context, relPath string) (*Photo, er
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
 FROM photos WHERE rel_path = $1;
 `
 	var ph Photo
 	err := p.pool.QueryRow(ctx, q, relPath).Scan(
-		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt,
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -132,13 +140,93 @@ FROM photos WHERE rel_path = $1;
 	return &ph, nil
 }
 
+// GetByLogicalPath trả bản ghi (không thùng rác) theo đường dẫn logic app dùng,
+// ví dụ "me/Photos/IMG_0001.jpg". Dùng cho GET/DELETE/MOVE và PROPFIND trên file.
+func (p *Postgres) GetByLogicalPath(ctx context.Context, logicalPath string) (*Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
+FROM photos WHERE logical_path = $1 AND is_trash = false
+ORDER BY uploaded_at DESC LIMIT 1;
+`
+	var ph Photo
+	err := p.pool.QueryRow(ctx, q, logicalPath).Scan(
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ph, nil
+}
+
+// ListByLogicalPrefix trả các ảnh (không thùng rác) có logical_path bắt đầu bằng
+// prefix (đã kèm dấu "/" cuối do caller). Dùng để PROPFIND liệt kê con của một
+// thư mục logic. Trả tối đa limit bản ghi, mới nhất trước.
+func (p *Postgres) ListByLogicalPrefix(ctx context.Context, prefix string, limit int) ([]Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
+FROM photos
+WHERE is_trash = false AND logical_path LIKE $1
+ORDER BY taken_at DESC
+LIMIT $2;
+`
+	// Escape ký tự đặc biệt của LIKE trong prefix để tránh khớp sai.
+	esc := escapeLike(prefix)
+	rows, err := p.pool.Query(ctx, q, esc+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Photo
+	for rows.Next() {
+		var ph Photo
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, ph)
+	}
+	return out, rows.Err()
+}
+
+// UpdateLogicalPath đổi logical_path (và original_name) của một bản ghi theo
+// rel_path vật lý. Dùng cho MOVE: file vật lý ở nguyên chỗ (layout yyyymm độc
+// lập với tên logic), chỉ cập nhật ánh xạ logic.
+func (p *Postgres) UpdateLogicalPath(ctx context.Context, relPath, newLogicalPath, newOriginalName string) error {
+	if !p.enabled() {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx,
+		`UPDATE photos SET logical_path = $2, original_name = $3 WHERE rel_path = $1;`,
+		relPath, newLogicalPath, newOriginalName,
+	)
+	return err
+}
+
+// escapeLike thoát các ký tự đặc biệt của toán tử LIKE (\, %, _) để prefix được
+// so khớp theo nghĩa đen.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
 // ListByDate trả các ảnh có taken_at trong [from, to), mới nhất trước.
 func (p *Postgres) ListByDate(ctx context.Context, from, to time.Time, limit int) ([]Photo, error) {
 	if !p.enabled() {
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
 FROM photos
 WHERE taken_at >= $1 AND taken_at < $2 AND is_trash = false
 ORDER BY taken_at DESC
@@ -153,7 +241,7 @@ LIMIT $3;
 	var out []Photo
 	for rows.Next() {
 		var ph Photo
-		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt); err != nil {
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, ph)
@@ -167,7 +255,7 @@ func (p *Postgres) ListAll(ctx context.Context, limit int) ([]Photo, error) {
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
 FROM photos WHERE is_trash = false ORDER BY taken_at DESC LIMIT $1;
 `
 	rows, err := p.pool.Query(ctx, q, limit)
@@ -179,7 +267,7 @@ FROM photos WHERE is_trash = false ORDER BY taken_at DESC LIMIT $1;
 	var out []Photo
 	for rows.Next() {
 		var ph Photo
-		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt); err != nil {
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, ph)
@@ -194,12 +282,12 @@ func (p *Postgres) GetBySHA256(ctx context.Context, hash string) (*Photo, error)
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
 FROM photos WHERE sha256 = $1 ORDER BY uploaded_at ASC LIMIT 1;
 `
 	var ph Photo
 	err := p.pool.QueryRow(ctx, q, hash).Scan(
-		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt,
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -216,7 +304,7 @@ func (p *Postgres) ListTrash(ctx context.Context, limit int) ([]Photo, error) {
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
 FROM photos WHERE is_trash = true ORDER BY taken_at DESC LIMIT $1;
 `
 	rows, err := p.pool.Query(ctx, q, limit)
@@ -228,7 +316,7 @@ FROM photos WHERE is_trash = true ORDER BY taken_at DESC LIMIT $1;
 	var out []Photo
 	for rows.Next() {
 		var ph Photo
-		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt); err != nil {
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, ph)
@@ -242,12 +330,12 @@ func (p *Postgres) GetByID(ctx context.Context, id int64) (*Photo, error) {
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at
 FROM photos WHERE id = $1;
 `
 	var ph Photo
 	err := p.pool.QueryRow(ctx, q, id).Scan(
-		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt,
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

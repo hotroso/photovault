@@ -124,7 +124,8 @@ type ReindexReport struct {
 }
 
 // Reindex quét root, upsert mọi file vào Postgres, xoá bản ghi không còn trên đĩa.
-func Reindex(ctx context.Context, root string, pg *store.Postgres) (*ReindexReport, error) {
+// user dùng để tái dựng logical_path (M2) khi không có thông tin logic trên đĩa.
+func Reindex(ctx context.Context, root, user string, pg *store.Postgres) (*ReindexReport, error) {
 	files, err := walk(root)
 	if err != nil {
 		return nil, err
@@ -154,6 +155,14 @@ func Reindex(ctx context.Context, root string, pg *store.Postgres) (*ReindexRepo
 		// LƯU Ý: dup_of KHÔNG thể dựng lại từ đĩa nên để NULL; file layout phẳng
 		// cũ không được tự động di trú trong thay đổi này (vẫn coi là không-rác).
 		isTrash := topLevelDir(rel) == "recyclebin"
+		// M2 — logical_path không được lưu trên đĩa nên dựng BEST-EFFORT:
+		// "<user>/Photos/<tên gốc>". Thư mục logic gốc mà app từng dùng không
+		// khôi phục được chính xác; chỉ bản ghi không-rác mới cần hiển thị qua
+		// WebDAV nên chỉ gán logical_path cho ảnh thường.
+		logical := ""
+		if !isTrash {
+			logical = user + "/Photos/" + filepath.Base(rel)
+		}
 		ph := store.Photo{
 			RelPath:      rel,
 			OriginalName: filepath.Base(rel),
@@ -162,6 +171,7 @@ func Reindex(ctx context.Context, root string, pg *store.Postgres) (*ReindexRepo
 			TakenAt:      taken,
 			MIME:         mimeByExt(rel),
 			IsTrash:      isTrash,
+			LogicalPath:  logical,
 		}
 		if err := pg.UpsertPhoto(ctx, ph); err != nil {
 			return nil, err

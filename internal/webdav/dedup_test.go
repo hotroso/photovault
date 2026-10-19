@@ -49,7 +49,7 @@ func TestStoreWithDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StageTemp lần 1: %v", err)
 	}
-	res1, dup1, err := h.storeWithDedup(ctx, staged1, "IMG_0001.JPG", mtime)
+	res1, dup1, err := h.storeWithDedup(ctx, staged1, "IMG_0001.JPG", mtime, "me/Photos/IMG_0001.JPG")
 	if err != nil {
 		t.Fatalf("storeWithDedup lần 1: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestStoreWithDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StageTemp lần 2: %v", err)
 	}
-	res2, dup2, err := h.storeWithDedup(ctx, staged2, "IMG_0002.JPG", mtime)
+	res2, dup2, err := h.storeWithDedup(ctx, staged2, "IMG_0002.JPG", mtime, "me/Photos/IMG_0002.JPG")
 	if err != nil {
 		t.Fatalf("storeWithDedup lần 2: %v", err)
 	}

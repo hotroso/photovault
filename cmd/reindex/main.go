@@ -37,7 +37,7 @@ func main() {
 	}
 	defer pg.Close()
 
-	rep, err := integrity.Reindex(ctx, cfg.DataDir, pg)
+	rep, err := integrity.Reindex(ctx, cfg.DataDir, cfg.User, pg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reindex lỗi:", err)
 		os.Exit(1)
