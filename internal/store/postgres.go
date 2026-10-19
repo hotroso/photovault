@@ -24,6 +24,8 @@ type Photo struct {
 	TakenAt      time.Time // từ X-OC-Mtime nếu có, nếu không là thời điểm upload
 	MIME         string
 	UploadedAt   time.Time
+	IsTrash      bool   // true nếu nằm trong thùng rác (recyclebin/) do trùng file
+	DupOf        *int64 // ID bản gốc mà file này trùng (nil nếu là bản gốc)
 }
 
 // Postgres bọc connection pool và các thao tác chỉ mục.
@@ -76,6 +78,11 @@ CREATE TABLE IF NOT EXISTS photos (
     uploaded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS photos_taken_at_idx ON photos (taken_at DESC);
+-- yyyymm + dedup toàn cục: cột thùng rác, con trỏ tới bản gốc, và chỉ mục
+-- sha256 KHÔNG unique (bản gốc và bản trùng dùng chung hash).
+ALTER TABLE photos ADD COLUMN IF NOT EXISTS is_trash BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE photos ADD COLUMN IF NOT EXISTS dup_of BIGINT;
+CREATE INDEX IF NOT EXISTS photos_sha256_idx ON photos (sha256);
 `
 	_, err := p.pool.Exec(ctx, schema)
 	return err
@@ -87,17 +94,19 @@ func (p *Postgres) UpsertPhoto(ctx context.Context, ph Photo) error {
 		return nil
 	}
 	const q = `
-INSERT INTO photos (rel_path, original_name, size, sha256, taken_at, mime, uploaded_at)
-VALUES ($1, $2, $3, $4, $5, $6, now())
+INSERT INTO photos (rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
 ON CONFLICT (rel_path) DO UPDATE SET
     original_name = EXCLUDED.original_name,
     size          = EXCLUDED.size,
     sha256        = EXCLUDED.sha256,
     taken_at      = EXCLUDED.taken_at,
     mime          = EXCLUDED.mime,
+    is_trash      = EXCLUDED.is_trash,
+    dup_of        = EXCLUDED.dup_of,
     uploaded_at   = now();
 `
-	_, err := p.pool.Exec(ctx, q, ph.RelPath, ph.OriginalName, ph.Size, ph.SHA256, ph.TakenAt, ph.MIME)
+	_, err := p.pool.Exec(ctx, q, ph.RelPath, ph.OriginalName, ph.Size, ph.SHA256, ph.TakenAt, ph.MIME, ph.IsTrash, ph.DupOf)
 	return err
 }
 
@@ -107,12 +116,12 @@ func (p *Postgres) GetByRelPath(ctx context.Context, relPath string) (*Photo, er
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
 FROM photos WHERE rel_path = $1;
 `
 	var ph Photo
 	err := p.pool.QueryRow(ctx, q, relPath).Scan(
-		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.UploadedAt,
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -129,9 +138,9 @@ func (p *Postgres) ListByDate(ctx context.Context, from, to time.Time, limit int
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, uploaded_at
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
 FROM photos
-WHERE taken_at >= $1 AND taken_at < $2
+WHERE taken_at >= $1 AND taken_at < $2 AND is_trash = false
 ORDER BY taken_at DESC
 LIMIT $3;
 `
@@ -144,7 +153,7 @@ LIMIT $3;
 	var out []Photo
 	for rows.Next() {
 		var ph Photo
-		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.UploadedAt); err != nil {
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, ph)
@@ -152,14 +161,14 @@ LIMIT $3;
 	return out, rows.Err()
 }
 
-// ListAll trả toàn bộ ảnh, mới nhất trước (dùng cho dashboard khi không lọc).
+// ListAll trả toàn bộ ảnh (không gồm thùng rác), mới nhất trước.
 func (p *Postgres) ListAll(ctx context.Context, limit int) ([]Photo, error) {
 	if !p.enabled() {
 		return nil, nil
 	}
 	const q = `
-SELECT id, rel_path, original_name, size, sha256, taken_at, mime, uploaded_at
-FROM photos ORDER BY taken_at DESC LIMIT $1;
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+FROM photos WHERE is_trash = false ORDER BY taken_at DESC LIMIT $1;
 `
 	rows, err := p.pool.Query(ctx, q, limit)
 	if err != nil {
@@ -170,12 +179,115 @@ FROM photos ORDER BY taken_at DESC LIMIT $1;
 	var out []Photo
 	for rows.Next() {
 		var ph Photo
-		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.UploadedAt); err != nil {
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, ph)
 	}
 	return out, rows.Err()
+}
+
+// GetBySHA256 trả bản gốc (tạo sớm nhất) có cùng hash — dùng để phát hiện trùng
+// file toàn cục. Không có → nil, nil.
+func (p *Postgres) GetBySHA256(ctx context.Context, hash string) (*Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+FROM photos WHERE sha256 = $1 ORDER BY uploaded_at ASC LIMIT 1;
+`
+	var ph Photo
+	err := p.pool.QueryRow(ctx, q, hash).Scan(
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ph, nil
+}
+
+// ListTrash trả các bản ghi trong thùng rác, mới nhất trước.
+func (p *Postgres) ListTrash(ctx context.Context, limit int) ([]Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+FROM photos WHERE is_trash = true ORDER BY taken_at DESC LIMIT $1;
+`
+	rows, err := p.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Photo
+	for rows.Next() {
+		var ph Photo
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, ph)
+	}
+	return out, rows.Err()
+}
+
+// GetByID trả bản ghi theo ID (dùng để tra tên bản gốc từ dup_of trong trang rác).
+func (p *Postgres) GetByID(ctx context.Context, id int64) (*Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, uploaded_at
+FROM photos WHERE id = $1;
+`
+	var ph Photo
+	err := p.pool.QueryRow(ctx, q, id).Scan(
+		&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.UploadedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ph, nil
+}
+
+// DeletePhotoByID xoá một bản ghi theo ID (xoá vĩnh viễn khỏi chỉ mục).
+func (p *Postgres) DeletePhotoByID(ctx context.Context, id int64) error {
+	if !p.enabled() {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx, `DELETE FROM photos WHERE id = $1;`, id)
+	return err
+}
+
+// DeletePhotoByRelPath xoá một bản ghi theo rel_path.
+func (p *Postgres) DeletePhotoByRelPath(ctx context.Context, rel string) error {
+	if !p.enabled() {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx, `DELETE FROM photos WHERE rel_path = $1;`, rel)
+	return err
+}
+
+// SetTrashState cập nhật rel_path, is_trash và dup_of cho bản ghi đang khôi phục
+// (hoặc đưa vào thùng rác). oldRelPath định vị bản ghi, newRelPath là vị trí mới
+// trên đĩa sau khi di chuyển.
+func (p *Postgres) SetTrashState(ctx context.Context, oldRelPath, newRelPath string, isTrash bool, dupOf *int64) error {
+	if !p.enabled() {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx,
+		`UPDATE photos SET rel_path = $2, is_trash = $3, dup_of = $4 WHERE rel_path = $1;`,
+		oldRelPath, newRelPath, isTrash, dupOf,
+	)
+	return err
 }
 
 // DeleteNotIn xoá các bản ghi mà rel_path không nằm trong tập keep (dùng cho reindex).

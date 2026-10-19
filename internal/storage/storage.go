@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -109,6 +110,200 @@ func (s *Storage) WriteAtomic(relPath string, src io.Reader, expectedSize int64,
 		AbsPath: abs,
 		Size:    n,
 		SHA256:  hex.EncodeToString(hasher.Sum(nil)),
+	}, nil
+}
+
+// StageResult là kết quả của bước staging: file đã ghi xuống .staging/, đã biết
+// SHA-256, nhưng CHƯA được đặt vào photos/ hay recyclebin/. Caller dùng hash này
+// để tra cứu trùng lặp toàn cục trước khi quyết định đích đến.
+type StageResult struct {
+	TempRel string // đường dẫn tương đối tới file staging, ví dụ ".staging/ab12cd.part"
+	Size    int64
+	SHA256  string
+}
+
+// StageTemp stream dữ liệu từ src vào một file tạm trong .staging/, tính SHA-256
+// trong lúc ghi (đọc một lần duy nhất) rồi fsync. KHÔNG rename — đích đến được
+// quyết định sau ở FinalizeStaged dựa trên hash. Dùng cho luồng dedup.
+// Nếu expectedSize >= 0 và kích thước thực khác → xoá file tạm và trả lỗi.
+func (s *Storage) StageTemp(src io.Reader, expectedSize int64) (*StageResult, error) {
+	var rb [16]byte
+	if _, err := rand.Read(rb[:]); err != nil {
+		return nil, fmt.Errorf("sinh tên tạm: %w", err)
+	}
+	tempRel := filepath.ToSlash(filepath.Join(".staging", hex.EncodeToString(rb[:])+".part"))
+
+	abs, err := s.safeJoin(tempRel)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return nil, fmt.Errorf("tạo thư mục staging: %w", err)
+	}
+
+	f, err := os.OpenFile(abs, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("mở file staging: %w", err)
+	}
+
+	hasher := sha256.New()
+	mw := io.MultiWriter(f, hasher)
+
+	n, copyErr := io.Copy(mw, src)
+	if copyErr != nil {
+		f.Close()
+		_ = os.Remove(abs)
+		return nil, fmt.Errorf("ghi dữ liệu staging: %w", copyErr)
+	}
+	if syncErr := f.Sync(); syncErr != nil {
+		f.Close()
+		_ = os.Remove(abs)
+		return nil, fmt.Errorf("fsync staging: %w", syncErr)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		_ = os.Remove(abs)
+		return nil, fmt.Errorf("đóng file staging: %w", closeErr)
+	}
+
+	if expectedSize >= 0 && n != expectedSize {
+		_ = os.Remove(abs)
+		return nil, fmt.Errorf("kích thước không khớp: nhận %d, mong đợi %d", n, expectedSize)
+	}
+
+	return &StageResult{
+		TempRel: tempRel,
+		Size:    n,
+		SHA256:  hex.EncodeToString(hasher.Sum(nil)),
+	}, nil
+}
+
+// RemoveStaged xoá một file staging (dùng ở nhánh lỗi của caller).
+func (s *Storage) RemoveStaged(tempRel string) error {
+	abs, err := s.safeJoin(tempRel)
+	if err != nil {
+		return err
+	}
+	return os.Remove(abs)
+}
+
+// yyyymmFromTime trả về chuỗi "yyyymm" từ ngày gốc của file. Dùng time.Now()
+// khi t rỗng (không có X-OC-Mtime).
+func yyyymmFromTime(t time.Time) string {
+	if t.IsZero() {
+		t = time.Now()
+	}
+	return t.Format("200601")
+}
+
+// collisionSafeName chọn một tên file không ghi đè file khác trong destDirAbs.
+//   - Nếu tên còn trống → dùng luôn.
+//   - Nếu đã có file cùng tên nhưng nội dung KHÁC → thử "<stem>_<hash8><ext>",
+//     rồi "<stem>_<hash12><ext>".
+//   - Nếu file cùng tên có nội dung GIỐNG HỆT → tái dùng tên đó (idempotent).
+//
+// So sánh nội dung rẻ trước: so size, chỉ hash file hiện có khi size khớp.
+func (s *Storage) collisionSafeName(destDirAbs, baseName, fullHash string) (string, error) {
+	ext := filepath.Ext(baseName)
+	stem := strings.TrimSuffix(baseName, ext)
+
+	candidates := []string{baseName}
+	if len(fullHash) >= 8 {
+		candidates = append(candidates, stem+"_"+fullHash[:8]+ext)
+	}
+	if len(fullHash) >= 12 {
+		candidates = append(candidates, stem+"_"+fullHash[:12]+ext)
+	}
+
+	for _, name := range candidates {
+		candAbs := filepath.Join(destDirAbs, name)
+		fi, err := os.Stat(candAbs)
+		if os.IsNotExist(err) {
+			return name, nil // tên còn trống
+		}
+		if err != nil {
+			return "", fmt.Errorf("kiểm tra file đích: %w", err)
+		}
+		same, err := sameContent(candAbs, fi.Size(), fullHash)
+		if err != nil {
+			return "", err
+		}
+		if same {
+			return name, nil // nội dung trùng khớp → tái dùng (idempotent)
+		}
+		// Khác nội dung → thử ứng viên tiếp theo.
+	}
+	return "", fmt.Errorf("không tìm được tên an toàn cho %q", baseName)
+}
+
+// sameContent cho biết file tại abs có nội dung giống hash hay không. So size
+// trước (rẻ), chỉ hash file khi size khớp.
+func sameContent(abs string, existingSize int64, fullHash string) (bool, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return false, fmt.Errorf("mở file đích: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, fmt.Errorf("hash file đích: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)) == fullHash, nil
+}
+
+// FinalizeStaged chuyển file staging vào đích cuối cùng dưới dạng
+// "<destDir>/<yyyymm>/<tên an toàn>". destDir là "photos" hoặc "recyclebin".
+// yyyymm suy từ mtime (ngày gốc) qua yyyymmFromTime. Tên file được chọn bởi
+// collisionSafeName để không bao giờ ghi đè file khác.
+func (s *Storage) FinalizeStaged(tempRel, destDir, baseName, fullHash string, mtime time.Time) (*Result, error) {
+	tempAbs, err := s.safeJoin(tempRel)
+	if err != nil {
+		return nil, err
+	}
+
+	relDir := filepath.ToSlash(filepath.Join(destDir, yyyymmFromTime(mtime)))
+	destDirAbs, err := s.safeJoin(relDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(destDirAbs, 0o755); err != nil {
+		return nil, fmt.Errorf("tạo thư mục đích: %w", err)
+	}
+
+	name, err := s.collisionSafeName(destDirAbs, baseName, fullHash)
+	if err != nil {
+		return nil, err
+	}
+
+	relPath := filepath.ToSlash(filepath.Join(relDir, name))
+	abs, err := s.safeJoin(relPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Nếu tái dùng tên có nội dung trùng (idempotent), file đích đã tồn tại và
+	// staging dư thừa → xoá staging, không rename đè.
+	if _, statErr := os.Stat(abs); statErr == nil {
+		_ = os.Remove(tempAbs)
+	} else if err := os.Rename(tempAbs, abs); err != nil {
+		_ = os.Remove(tempAbs)
+		return nil, fmt.Errorf("rename vào đích: %w", err)
+	}
+
+	if !mtime.IsZero() {
+		_ = os.Chtimes(abs, mtime, mtime)
+	}
+
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("stat file đích: %w", err)
+	}
+
+	return &Result{
+		RelPath: filepath.ToSlash(relPathFromRoot(s.root, abs)),
+		AbsPath: abs,
+		Size:    fi.Size(),
+		SHA256:  fullHash,
 	}, nil
 }
 
