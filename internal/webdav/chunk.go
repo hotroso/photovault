@@ -133,10 +133,11 @@ func (h *Handler) uploadAssemble(w http.ResponseWriter, r *http.Request, rel str
 		}
 	}
 
-	res, err := h.store.WriteAtomic(dest, multi, expected, mtime)
+	// Stage trước (hash một lần) rồi quyết định photos/ hay recyclebin/ theo dedup.
+	staged, err := h.store.StageTemp(multi, expected)
 	closeAll(files)
 	if err != nil {
-		h.logger.Error("ghép chunk lỗi", "dest", dest, "err", err)
+		h.logger.Error("ghép & stage chunk lỗi", "dest", dest, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -144,7 +145,12 @@ func (h *Handler) uploadAssemble(w http.ResponseWriter, r *http.Request, rel str
 	// Dọn thư mục chunk tạm.
 	_ = h.store.Remove(chunkDirRel(uuidRel))
 
-	h.indexPhoto(r.Context(), res, mtime)
+	res, _, err := h.storeWithDedup(r.Context(), staged, filepath.Base(dest), mtime)
+	if err != nil {
+		h.logger.Error("lưu file ghép lỗi", "dest", dest, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("OC-ETag", fmt.Sprintf("%q", res.SHA256[:16]))
 	w.WriteHeader(http.StatusCreated) // 201

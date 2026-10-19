@@ -206,19 +206,58 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 		expected = r.ContentLength
 	}
 
-	res, err := h.store.WriteAtomic(rel, r.Body, expected, mtime)
+	// Stage trước (hash một lần) rồi quyết định photos/ hay recyclebin/ theo dedup.
+	staged, err := h.store.StageTemp(r.Body, expected)
 	if err != nil {
-		h.logger.Error("PUT ghi lỗi", "rel", rel, "err", err)
+		h.logger.Error("PUT stage lỗi", "rel", rel, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	h.indexPhoto(r.Context(), res, mtime)
+	res, _, err := h.storeWithDedup(r.Context(), staged, path.Base(rel), mtime)
+	if err != nil {
+		// storeWithDedup đã RemoveStaged ở nhánh lỗi finalize.
+		h.logger.Error("PUT lưu lỗi", "rel", rel, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("OC-ETag", fmt.Sprintf("%q", res.SHA256[:16]))
 	w.Header().Set("ETag", fmt.Sprintf("%q", res.SHA256[:16]))
 	w.WriteHeader(http.StatusCreated) // 201
 	h.logger.Info("đã lưu ảnh", "rel", res.RelPath, "size", res.Size, "sha256", res.SHA256[:12])
+}
+
+// storeWithDedup hoàn tất một file đã stage: tra hash toàn cục để quyết định
+// đưa vào photos/ (bản gốc) hay recyclebin/ (bản trùng, is_trash=true, dup_of=gốc).
+// Luôn trả về *Result khi không lỗi; dup=true nếu là bản trùng. Dù dedup hay
+// không, một lỗi DB tra cứu KHÔNG bao giờ chặn backup — khi đó coi như không trùng.
+func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResult, baseName string, mtime time.Time) (*storage.Result, bool, error) {
+	existing, err := h.pg.GetBySHA256(ctx, staged.SHA256)
+	if err != nil {
+		h.logger.Warn("tra cứu hash thất bại, coi như không trùng", "hash", staged.SHA256[:12], "err", err)
+		existing = nil
+	}
+
+	if existing != nil {
+		res, ferr := h.store.FinalizeStaged(staged.TempRel, "recyclebin", baseName, staged.SHA256, mtime)
+		if ferr != nil {
+			_ = h.store.RemoveStaged(staged.TempRel)
+			return nil, false, ferr
+		}
+		dupOf := existing.ID
+		h.indexPhoto(ctx, res, mtime, true, &dupOf)
+		h.logger.Warn("phát hiện trùng → đưa vào thùng rác", "hash", staged.SHA256[:12], "rel", res.RelPath, "gốc", existing.RelPath)
+		return res, true, nil
+	}
+
+	res, ferr := h.store.FinalizeStaged(staged.TempRel, "photos", baseName, staged.SHA256, mtime)
+	if ferr != nil {
+		_ = h.store.RemoveStaged(staged.TempRel)
+		return nil, false, ferr
+	}
+	h.indexPhoto(ctx, res, mtime, false, nil)
+	return res, false, nil
 }
 
 // ---- MOVE (đổi tên / di chuyển trong files/) ----
@@ -246,7 +285,7 @@ func (h *Handler) move(w http.ResponseWriter, r *http.Request, rel string) {
 		return
 	}
 	_ = h.store.Remove(rel)
-	h.indexPhoto(r.Context(), res, time.Time{})
+	h.indexPhoto(r.Context(), res, time.Time{}, false, nil)
 	w.WriteHeader(http.StatusNoContent) // 204
 }
 
@@ -283,7 +322,8 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request, rel string) {
 }
 
 // indexPhoto ghi bản ghi vào Postgres (no-op nếu PG chưa cấu hình).
-func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime time.Time) {
+// isTrash/dupOf đánh dấu bản trùng đã bị đưa vào thùng rác.
+func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime time.Time, isTrash bool, dupOf *int64) {
 	taken := mtime
 	if taken.IsZero() {
 		taken = time.Now()
@@ -295,6 +335,8 @@ func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime tim
 		SHA256:       res.SHA256,
 		TakenAt:      taken,
 		MIME:         contentTypeByExt(res.RelPath),
+		IsTrash:      isTrash,
+		DupOf:        dupOf,
 	}
 	if err := h.pg.UpsertPhoto(ctx, ph); err != nil {
 		h.logger.Warn("index Postgres thất bại", "rel", res.RelPath, "err", err)
