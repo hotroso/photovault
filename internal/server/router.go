@@ -81,7 +81,7 @@ func rootHandler(logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			_, _ = w.Write([]byte("nextcloud-fake: OK. Xem /dashboard\n"))
+			_, _ = w.Write([]byte("photovault: OK. Xem /dashboard\n"))
 			return
 		}
 		http.NotFound(w, r)

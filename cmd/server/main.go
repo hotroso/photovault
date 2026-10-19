@@ -57,7 +57,7 @@ func main() {
 
 	st := storage.New(cfg.DataDir)
 
-	logger.Info("khởi động nextcloud-fake",
+	logger.Info("khởi động photovault",
 		"user", cfg.User,
 		"data_dir", cfg.DataDir,
 		"tls", cfg.UsesTLS(),
