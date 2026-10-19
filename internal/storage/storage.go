@@ -307,6 +307,113 @@ func (s *Storage) FinalizeStaged(tempRel, destDir, baseName, fullHash string, mt
 	}, nil
 }
 
+// MoveCollisionSafe di chuyển file srcRel sang "<destDir>/<yyyymm>/<tên an toàn>"
+// mà không ghi đè file khác. yyyymm được giữ nguyên từ segment ngày trong srcRel
+// (ví dụ "recyclebin/202303/a.jpg" → giữ "202303") để bảo toàn ngày gốc; nếu
+// srcRel không có segment yyyymm hợp lệ thì suy từ mtime. Dùng để khôi phục file
+// từ thùng rác (recyclebin/ → photos/). File được rename trực tiếp (cùng
+// filesystem), chỉ hash lại khi cần chọn tên tránh trùng.
+func (s *Storage) MoveCollisionSafe(srcRel, destDir string, mtime time.Time) (*Result, error) {
+	srcAbs, err := s.safeJoin(srcRel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Giữ segment yyyymm từ srcRel nếu hợp lệ, nếu không suy từ mtime.
+	yyyymm := yyyymmFromRel(srcRel)
+	if yyyymm == "" {
+		yyyymm = yyyymmFromTime(mtime)
+	}
+
+	baseName := filepath.Base(srcRel)
+
+	// Hash file nguồn để collisionSafeName có thể so sánh nội dung khi trùng tên.
+	fullHash, _, err := hashFileAt(srcAbs)
+	if err != nil {
+		return nil, err
+	}
+
+	relDir := filepath.ToSlash(filepath.Join(destDir, yyyymm))
+	destDirAbs, err := s.safeJoin(relDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(destDirAbs, 0o755); err != nil {
+		return nil, fmt.Errorf("tạo thư mục đích: %w", err)
+	}
+
+	name, err := s.collisionSafeName(destDirAbs, baseName, fullHash)
+	if err != nil {
+		return nil, err
+	}
+
+	relPath := filepath.ToSlash(filepath.Join(relDir, name))
+	abs, err := s.safeJoin(relPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Nếu đích đã tồn tại với nội dung trùng (idempotent) → xoá nguồn, không rename đè.
+	if _, statErr := os.Stat(abs); statErr == nil {
+		_ = os.Remove(srcAbs)
+	} else if err := os.Rename(srcAbs, abs); err != nil {
+		return nil, fmt.Errorf("rename vào đích: %w", err)
+	}
+
+	if !mtime.IsZero() {
+		_ = os.Chtimes(abs, mtime, mtime)
+	}
+
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("stat file đích: %w", err)
+	}
+
+	return &Result{
+		RelPath: filepath.ToSlash(relPathFromRoot(s.root, abs)),
+		AbsPath: abs,
+		Size:    fi.Size(),
+		SHA256:  fullHash,
+	}, nil
+}
+
+// yyyymmFromRel trích segment "yyyymm" (6 chữ số) ở vị trí thứ hai của rel, ví
+// dụ "recyclebin/202303/a.jpg" → "202303". Trả rỗng nếu không khớp.
+func yyyymmFromRel(rel string) string {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) >= 3 {
+		seg := parts[1]
+		if len(seg) == 6 {
+			allDigit := true
+			for _, c := range seg {
+				if c < '0' || c > '9' {
+					allDigit = false
+					break
+				}
+			}
+			if allDigit {
+				return seg
+			}
+		}
+	}
+	return ""
+}
+
+// hashFileAt tính SHA-256 (hex) và kích thước của một file theo đường dẫn tuyệt đối.
+func hashFileAt(abs string) (string, int64, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", 0, fmt.Errorf("mở file nguồn: %w", err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", 0, fmt.Errorf("hash file nguồn: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
 // Mkdir tạo một thư mục (cho WebDAV MKCOL).
 func (s *Storage) Mkdir(relPath string) error {
 	abs, err := s.safeJoin(relPath)

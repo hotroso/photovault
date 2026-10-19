@@ -70,6 +70,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /dashboard", dash.Index)
 	mux.HandleFunc("GET /thumb", dash.Thumb)
 	mux.HandleFunc("GET /media", dash.Media)
+	mux.HandleFunc("POST /trash/delete", dash.TrashDelete)
+	mux.HandleFunc("POST /trash/restore", dash.TrashRestore)
 
 	mux.HandleFunc("/", rootHandler(logger))
 

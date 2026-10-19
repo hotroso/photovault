@@ -26,7 +26,7 @@ func walk(root string) ([]string, error) {
 		}
 		if d.IsDir() {
 			name := d.Name()
-			if name == ".uploads" || name == ".thumbs" {
+			if name == ".uploads" || name == ".thumbs" || name == ".staging" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -148,6 +148,12 @@ func Reindex(ctx context.Context, root string, pg *store.Postgres) (*ReindexRepo
 		if taken.IsZero() {
 			taken = time.Now()
 		}
+		// is_trash suy từ thư mục cấp cao nhất của rel (layout tự mô tả theo
+		// DESIGN.md §6b): "recyclebin/..." → trong thùng rác; "photos/..." →
+		// ảnh thường. File layout phẳng cũ ("<user>/...") được index là không-rác.
+		// LƯU Ý: dup_of KHÔNG thể dựng lại từ đĩa nên để NULL; file layout phẳng
+		// cũ không được tự động di trú trong thay đổi này (vẫn coi là không-rác).
+		isTrash := topLevelDir(rel) == "recyclebin"
 		ph := store.Photo{
 			RelPath:      rel,
 			OriginalName: filepath.Base(rel),
@@ -155,6 +161,7 @@ func Reindex(ctx context.Context, root string, pg *store.Postgres) (*ReindexRepo
 			SHA256:       sum,
 			TakenAt:      taken,
 			MIME:         mimeByExt(rel),
+			IsTrash:      isTrash,
 		}
 		if err := pg.UpsertPhoto(ctx, ph); err != nil {
 			return nil, err
@@ -168,6 +175,16 @@ func Reindex(ctx context.Context, root string, pg *store.Postgres) (*ReindexRepo
 	}
 	rep.Removed = removed
 	return rep, nil
+}
+
+// topLevelDir trả segment thư mục cấp cao nhất của một rel dạng slash, ví dụ
+// "recyclebin/202303/a.jpg" → "recyclebin". Rỗng nếu rel không có "/".
+func topLevelDir(rel string) string {
+	rel = filepath.ToSlash(rel)
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		return rel[:i]
+	}
+	return ""
 }
 
 func mimeByExt(name string) string {

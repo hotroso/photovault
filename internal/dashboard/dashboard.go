@@ -36,12 +36,14 @@ func New(cfg *config.Config, st *storage.Storage, pg *store.Postgres, logger *sl
 }
 
 type viewItem struct {
-	RelPath  string
-	Name     string
-	SizeKB   int64
-	TakenAt  string
-	IsImage  bool // JPEG/PNG → có thumbnail; còn lại hiển thị icon
-	MIME     string
+	RelPath string
+	Name    string
+	SizeKB  int64
+	TakenAt string
+	IsImage bool // JPEG/PNG → có thumbnail; còn lại hiển thị icon
+	MIME    string
+	IsTrash bool   // true khi hiển thị trong trang thùng rác
+	DupInfo string // tên bản gốc mà file này trùng (chỉ dùng ở trang rác)
 }
 
 var page = template.Must(template.New("dash").Parse(`<!doctype html>
@@ -62,76 +64,197 @@ var page = template.Must(template.New("dash").Parse(`<!doctype html>
  .meta{padding:.5rem;font-size:.75rem}
  .meta .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
  .meta .sub{color:#888}
+ .meta .dup{color:#b45309;font-style:italic;margin-top:.15rem}
  .empty{padding:3rem;text-align:center;color:#888}
+ nav{display:flex;gap:.75rem}
+ nav a{text-decoration:none;color:#555;padding:.35rem .6rem;border-radius:6px}
+ nav a.active{background:#1a1a1a;color:#fff}
+ .actions{display:flex;gap:.4rem;padding:0 .5rem .5rem}
+ .actions form{margin:0}
+ .actions button{flex:1;padding:.3rem;font-size:.7rem;border:1px solid #ccc;border-radius:6px;background:#f7f7f7;cursor:pointer}
+ .actions button.danger{color:#b00020;border-color:#f0c0c8}
 </style></head><body>
 <header>
  <h1>Backup ảnh iPhone</h1>
+ <nav>
+   <a href="/dashboard" class="{{if not .Trash}}active{{end}}">Ảnh</a>
+   <a href="/dashboard?view=trash" class="{{if .Trash}}active{{end}}">Thùng rác ({{.TrashCount}})</a>
+ </nav>
  <span class="stat">{{.Count}} mục · user <code>{{.User}}</code></span>
+ {{if not .Trash}}
  <form method="GET" action="/dashboard">
    <label>Ngày: <input type="date" name="date" value="{{.Date}}"></label>
    <button type="submit">Lọc</button>
    {{if .Date}}<a href="/dashboard">Bỏ lọc</a>{{end}}
  </form>
+ {{end}}
 </header>
 {{if .Items}}
 <div class="grid">
  {{range .Items}}
+ {{if .IsTrash}}
+ <div class="cell">
+   <a href="/media?path={{.RelPath}}" target="_blank">
+     {{if .IsImage}}<img loading="lazy" src="/thumb?path={{.RelPath}}" alt="{{.Name}}">
+     {{else}}<div class="icon">{{if eq .MIME "video/quicktime"}}🎞️{{else if eq .MIME "video/mp4"}}🎞️{{else}}🖼️{{end}}</div>{{end}}
+   </a>
+   <div class="meta"><div class="nm">{{.Name}}</div><div class="sub">{{.TakenAt}} · {{.SizeKB}} KB</div><div class="dup">trùng với {{if .DupInfo}}{{.DupInfo}}{{else}}(không rõ bản gốc){{end}}</div></div>
+   <div class="actions">
+     <form method="POST" action="/trash/restore"><input type="hidden" name="rel" value="{{.RelPath}}"><button type="submit">Khôi phục</button></form>
+     <form method="POST" action="/trash/delete"><input type="hidden" name="rel" value="{{.RelPath}}"><button type="submit" class="danger">Xoá vĩnh viễn</button></form>
+   </div>
+ </div>
+ {{else}}
  <a class="cell" href="/media?path={{.RelPath}}" target="_blank">
    {{if .IsImage}}<img loading="lazy" src="/thumb?path={{.RelPath}}" alt="{{.Name}}">
    {{else}}<div class="icon">{{if eq .MIME "video/quicktime"}}🎞️{{else if eq .MIME "video/mp4"}}🎞️{{else}}🖼️{{end}}</div>{{end}}
    <div class="meta"><div class="nm">{{.Name}}</div><div class="sub">{{.TakenAt}} · {{.SizeKB}} KB</div></div>
  </a>
  {{end}}
+ {{end}}
 </div>
 {{else}}
-<div class="empty">Chưa có ảnh nào{{if .Date}} trong ngày này{{end}}. Bật Auto Upload trên app Nextcloud để bắt đầu backup.</div>
+<div class="empty">{{if .Trash}}Thùng rác trống.{{else}}Chưa có ảnh nào{{if .Date}} trong ngày này{{end}}. Bật Auto Upload trên app Nextcloud để bắt đầu backup.{{end}}</div>
 {{end}}
 </body></html>`))
 
-// Index phục vụ GET /dashboard (?date=YYYY-MM-DD để lọc).
+// Index phục vụ GET /dashboard (?date=YYYY-MM-DD để lọc, ?view=trash xem thùng rác).
 func (d *Dashboard) Index(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dateStr := r.URL.Query().Get("date")
+	trashView := r.URL.Query().Get("view") == "trash"
 
-	var photos []store.Photo
-	var err error
-	if dateStr != "" {
-		var day time.Time
-		day, err = time.ParseInLocation("2006-01-02", dateStr, time.Local)
-		if err == nil {
-			photos, err = d.pg.ListByDate(ctx, day, day.AddDate(0, 0, 1), 2000)
+	// Danh sách thùng rác dùng để vừa hiển thị tab đếm, vừa (ở chế độ trash) làm lưới.
+	trash, err := d.pg.ListTrash(ctx, 2000)
+	if err != nil {
+		d.logger.Error("truy vấn thùng rác lỗi", "err", err)
+	}
+	trashCount := len(trash)
+
+	items := make([]viewItem, 0)
+	if trashView {
+		for _, p := range trash {
+			dupInfo := ""
+			if p.DupOf != nil {
+				if orig, gerr := d.pg.GetByID(ctx, *p.DupOf); gerr != nil {
+					d.logger.Error("tra bản gốc của file trùng lỗi", "err", gerr, "dup_of", *p.DupOf)
+				} else if orig != nil {
+					dupInfo = orig.OriginalName
+					if dupInfo == "" {
+						dupInfo = orig.RelPath
+					}
+				}
+			}
+			items = append(items, viewItem{
+				RelPath: p.RelPath,
+				Name:    p.OriginalName,
+				SizeKB:  p.Size / 1024,
+				TakenAt: p.TakenAt.Local().Format("2006-01-02 15:04"),
+				IsImage: isThumbnailable(p.MIME),
+				MIME:    p.MIME,
+				IsTrash: true,
+				DupInfo: dupInfo,
+			})
 		}
 	} else {
-		photos, err = d.pg.ListAll(ctx, 2000)
-	}
-	if err != nil {
-		d.logger.Error("truy vấn dashboard lỗi", "err", err)
+		var photos []store.Photo
+		if dateStr != "" {
+			var day time.Time
+			day, err = time.ParseInLocation("2006-01-02", dateStr, time.Local)
+			if err == nil {
+				photos, err = d.pg.ListByDate(ctx, day, day.AddDate(0, 0, 1), 2000)
+			}
+		} else {
+			photos, err = d.pg.ListAll(ctx, 2000)
+		}
+		if err != nil {
+			d.logger.Error("truy vấn dashboard lỗi", "err", err)
+		}
+		for _, p := range photos {
+			items = append(items, viewItem{
+				RelPath: p.RelPath,
+				Name:    p.OriginalName,
+				SizeKB:  p.Size / 1024,
+				TakenAt: p.TakenAt.Local().Format("2006-01-02 15:04"),
+				IsImage: isThumbnailable(p.MIME),
+				MIME:    p.MIME,
+			})
+		}
 	}
 
 	count, _ := d.pg.Count(ctx)
 
-	items := make([]viewItem, 0, len(photos))
-	for _, p := range photos {
-		items = append(items, viewItem{
-			RelPath: p.RelPath,
-			Name:    p.OriginalName,
-			SizeKB:  p.Size / 1024,
-			TakenAt: p.TakenAt.Local().Format("2006-01-02 15:04"),
-			IsImage: isThumbnailable(p.MIME),
-			MIME:    p.MIME,
-		})
-	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data := struct {
-		User  string
-		Count int64
-		Date  string
-		Items []viewItem
-	}{d.cfg.User, count, dateStr, items}
+		User       string
+		Count      int64
+		Date       string
+		Trash      bool
+		TrashCount int
+		Items      []viewItem
+	}{d.cfg.User, count, dateStr, trashView, trashCount, items}
 	if err := page.Execute(w, data); err != nil {
 		d.logger.Error("render dashboard lỗi", "err", err)
 	}
+}
+
+// TrashDelete phục vụ POST /trash/delete — xoá vĩnh viễn một file trong thùng rác
+// khỏi đĩa VÀ khỏi chỉ mục. Chỉ chấp nhận rel nằm dưới recyclebin/.
+func (d *Dashboard) TrashDelete(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "form không hợp lệ", http.StatusBadRequest)
+		return
+	}
+	rel := r.FormValue("rel")
+	if !strings.HasPrefix(rel, "recyclebin/") {
+		http.Error(w, "chỉ xoá được file trong thùng rác", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	if err := d.store.Remove(rel); err != nil {
+		d.logger.Error("xoá file thùng rác khỏi đĩa lỗi", "err", err, "rel", rel)
+		http.Error(w, "xoá file lỗi", http.StatusInternalServerError)
+		return
+	}
+	if err := d.pg.DeletePhotoByRelPath(ctx, rel); err != nil {
+		d.logger.Error("xoá bản ghi thùng rác khỏi DB lỗi", "err", err, "rel", rel)
+	}
+	d.logger.Info("đã xoá vĩnh viễn file trong thùng rác", "rel", rel)
+	http.Redirect(w, r, "/dashboard?view=trash", http.StatusSeeOther)
+}
+
+// TrashRestore phục vụ POST /trash/restore — khôi phục một file từ recyclebin/
+// về photos/ (collision-safe), cập nhật is_trash=false, dup_of=NULL. File di
+// chuyển trên đĩa là source of truth; DB chỉ chạy theo. Chỉ nhận rel dưới recyclebin/.
+func (d *Dashboard) TrashRestore(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "form không hợp lệ", http.StatusBadRequest)
+		return
+	}
+	rel := r.FormValue("rel")
+	if !strings.HasPrefix(rel, "recyclebin/") {
+		http.Error(w, "chỉ khôi phục được file trong thùng rác", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+
+	// Giữ ngày gốc: lấy mtime từ file trên đĩa (MoveCollisionSafe cũng giữ yyyymm từ rel).
+	var mtime time.Time
+	if fi, _, serr := d.store.Stat(rel); serr == nil {
+		mtime = fi.ModTime()
+	}
+
+	res, err := d.store.MoveCollisionSafe(rel, "photos", mtime)
+	if err != nil {
+		d.logger.Error("khôi phục file khỏi thùng rác lỗi", "err", err, "rel", rel)
+		http.Error(w, "khôi phục lỗi", http.StatusInternalServerError)
+		return
+	}
+	if err := d.pg.SetTrashState(ctx, rel, res.RelPath, false, nil); err != nil {
+		d.logger.Error("cập nhật trạng thái khôi phục trong DB lỗi", "err", err, "rel", rel, "new", res.RelPath)
+	}
+	d.logger.Info("đã khôi phục file khỏi thùng rác", "từ", rel, "đến", res.RelPath)
+	http.Redirect(w, r, "/dashboard?view=trash", http.StatusSeeOther)
 }
 
 // Thumb phục vụ GET /thumb?path=... — sinh thumbnail JPEG 300px cho ảnh JPEG/PNG.
