@@ -259,7 +259,10 @@ func (h *Handler) mkcol(w http.ResponseWriter, r *http.Request, rel string) {
 // ---- PUT (ảnh nhỏ, upload trực tiếp) ----
 
 func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
-	mtime := parseOCMtime(r.Header.Get("X-OC-Mtime"))
+	// Ngày gốc: X-OC-Mtime nếu có, nếu không suy từ tên file do app đặt
+	// ("YY-MM-DD HH-MM-SS ...") để yyyymm/taken_at phản ánh NGÀY CHỤP, không
+	// phải ngày upload.
+	mtime := originalDate(parseOCMtime(r.Header.Get("X-OC-Mtime")), path.Base(rel))
 	expected := int64(-1)
 	if r.ContentLength > 0 {
 		expected = r.ContentLength

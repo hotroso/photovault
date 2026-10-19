@@ -82,7 +82,9 @@ func (h *Handler) uploadAssemble(w http.ResponseWriter, r *http.Request, rel str
 		http.Error(w, "thiếu Destination", http.StatusBadRequest)
 		return
 	}
-	mtime := parseOCMtime(r.Header.Get("X-OC-Mtime"))
+	// Ngày gốc: X-OC-Mtime nếu có, nếu không suy từ tên file đích (video lớn
+	// cũng theo mẫu "YY-MM-DD HH-MM-SS ..."). Xem originalDate trong helpers.go.
+	mtime := originalDate(parseOCMtime(r.Header.Get("X-OC-Mtime")), filepath.Base(dest))
 
 	// rel = "<user>/<uuid>/.file" → thư mục chunk là "<user>/<uuid>"
 	uuidRel := strings.TrimSuffix(rel, "/.file")
