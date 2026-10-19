@@ -54,3 +54,6 @@ Thumbs.db
 # ===== Source Nextcloud tham khảo (~16k file) — KHÔNG commit vào repo này =====
 # Đây là bản clone chỉ để đối chiếu định dạng handshake; không phải code của dự án.
 /reference/nextcloud-server/
+
+# ===== Workflow/agent task metadata (KHÔNG commit — chỉ là bookkeeping nội bộ) =====
+/.agents/
