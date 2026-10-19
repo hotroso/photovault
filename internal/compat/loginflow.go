@@ -75,7 +75,10 @@ func (lf *LoginFlow) Poll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	token := r.PostForm.Get("token")
+	// App Nextcloud iOS gửi token qua query string ở endpoint poll (không phải
+	// body form). r.Form gộp cả query lẫn body nên bắt được token dù nằm ở đâu;
+	// r.PostForm chỉ có body → sẽ rỗng và luôn trả 404 (bug cũ).
+	token := r.Form.Get("token")
 
 	st, ok, err := lf.redis.GetPoll(r.Context(), token)
 	if err != nil {
