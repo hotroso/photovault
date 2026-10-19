@@ -11,6 +11,7 @@ import (
 	_ "image/png"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -206,7 +207,7 @@ func (d *Dashboard) TrashDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := r.FormValue("rel")
-	if !strings.HasPrefix(rel, "recyclebin/") {
+	if !isRecyclebinRel(rel) {
 		http.Error(w, "chỉ xoá được file trong thùng rác", http.StatusBadRequest)
 		return
 	}
@@ -232,7 +233,7 @@ func (d *Dashboard) TrashRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := r.FormValue("rel")
-	if !strings.HasPrefix(rel, "recyclebin/") {
+	if !isRecyclebinRel(rel) {
 		http.Error(w, "chỉ khôi phục được file trong thùng rác", http.StatusBadRequest)
 		return
 	}
@@ -316,4 +317,16 @@ func (d *Dashboard) Media(w http.ResponseWriter, r *http.Request) {
 
 func isThumbnailable(mime string) bool {
 	return strings.EqualFold(mime, "image/jpeg") || strings.EqualFold(mime, "image/png")
+}
+
+// isRecyclebinRel xác nhận rel sau khi làm sạch (giống storage.safeJoin) vẫn có
+// segment cấp cao nhất là "recyclebin". Chống bypass kiểu
+// "recyclebin/../photos/202303/x.jpg": HasPrefix lọt nhưng filepath.Clean đưa nó
+// về "photos/..." — một bản gốc còn sống, KHÔNG nằm trong thùng rác.
+func isRecyclebinRel(rel string) bool {
+	clean := filepath.Clean("/" + strings.ReplaceAll(rel, "\\", "/"))
+	clean = strings.TrimPrefix(clean, "/")
+	clean = filepath.ToSlash(clean)
+	seg, _, _ := strings.Cut(clean, "/")
+	return seg == "recyclebin"
 }
