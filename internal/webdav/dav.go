@@ -112,10 +112,23 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, rel string) {
 		depth = "1"
 	}
 
+	ms := multistatus{
+		XMLNSD:  "DAV:",
+		XMLNSOC: "http://owncloud.org/ns",
+		XMLNSNC: "http://nextcloud.org/ns",
+	}
+
 	fi, abs, err := h.store.Stat(rel)
 	if err != nil {
 		if os.IsNotExist(err) {
-			http.Error(w, "Not Found", http.StatusNotFound)
+			// M1 — WebDAV ảo: không gian files/<user>/... không ánh xạ 1-1 với
+			// đĩa (file thật nằm ở photos/<yyyymm>/). App Nextcloud PROPFIND thư
+			// mục đích (vd files/me, files/me/InstantUpload) trước khi upload;
+			// nếu trả 404 app sẽ coi server không hợp lệ và KHÔNG upload. Vì vậy
+			// mọi đường dẫn chưa có trên đĩa trong không gian này được coi là một
+			// collection ẢO rỗng (207) để app yên tâm đẩy ảnh lên.
+			ms.Responses = append(ms.Responses, virtualDirResponse(r.URL.Path))
+			writeMultistatus(w, h.logger, ms)
 			return
 		}
 		h.logger.Error("PROPFIND stat lỗi", "rel", rel, "err", err)
@@ -123,11 +136,6 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, rel string) {
 		return
 	}
 
-	ms := multistatus{
-		XMLNSD:  "DAV:",
-		XMLNSOC: "http://owncloud.org/ns",
-		XMLNSNC: "http://nextcloud.org/ns",
-	}
 	ms.Responses = append(ms.Responses, h.responseFor(r.URL.Path, fi))
 
 	// Depth 1 trên thư mục: liệt kê các con.
@@ -151,12 +159,33 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, rel string) {
 		}
 	}
 
+	writeMultistatus(w, h.logger, ms)
+}
+
+// writeMultistatus phát 207 Multi-Status kèm body XML.
+func writeMultistatus(w http.ResponseWriter, logger *slog.Logger, ms multistatus) {
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(http.StatusMultiStatus) // 207
 	_, _ = w.Write([]byte(xml.Header))
 	enc := xml.NewEncoder(w)
 	if err := enc.Encode(ms); err != nil {
-		h.logger.Error("encode PROPFIND lỗi", "err", err)
+		logger.Error("encode PROPFIND lỗi", "err", err)
+	}
+}
+
+// virtualDirResponse tạo một entry collection ẢO (không có file vật lý) cho
+// PROPFIND trong không gian files/<user>/... — dùng cho M1 (xem ghi chú ở propfind).
+func virtualDirResponse(href string) davResponse {
+	return davResponse{
+		Href: href,
+		Propstat: davPropstat{
+			Prop: davProp{
+				ResourceType: &resourceType{Collection: &struct{}{}},
+				LastModified: time.Now().UTC().Format(http.TimeFormat),
+				ETag:         fmt.Sprintf("%q", "virtual"),
+			},
+			Status: "HTTP/1.1 200 OK",
+		},
 	}
 }
 
@@ -189,11 +218,9 @@ func etagOf(fi os.FileInfo) string {
 // ---- MKCOL ----
 
 func (h *Handler) mkcol(w http.ResponseWriter, r *http.Request, rel string) {
-	if err := h.store.Mkdir(rel); err != nil {
-		h.logger.Error("MKCOL lỗi", "rel", rel, "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
+	// M1 — WebDAV ảo: app tạo thư mục đích (vd me/, me/InstantUpload) trước khi
+	// upload, nhưng file thật đi vào photos/<yyyymm>/ nên KHÔNG cần tạo thư mục
+	// vật lý tương ứng (tránh rác thư mục me/ trên đĩa). Luôn báo 201 thành công.
 	w.WriteHeader(http.StatusCreated) // 201
 }
 
