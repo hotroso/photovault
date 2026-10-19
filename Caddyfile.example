@@ -1,0 +1,27 @@
+# Mẫu Caddyfile đặt TRƯỚC server Go để lo TLS trên Ubuntu LAN.
+# Dùng khi bạn muốn HTTPS mà server Go chỉ nói HTTP ở localhost.
+#
+# Chạy:  caddy run --config Caddyfile
+#
+# Với IP LAN, Caddy dùng internal CA (cert tự ký của chính Caddy). Sau khi chạy
+# lần đầu, export root CA của Caddy và cài + tin cậy nó trên iPhone:
+#   - Root CA nằm ở: ~/.local/share/caddy/pki/authorities/local/root.crt
+#   - AirDrop/email file đó về iPhone, cài profile, rồi bật trust đầy đủ ở
+#     Settings > General > About > Certificate Trust Settings.
+
+{
+	# Dùng CA nội bộ của Caddy cho địa chỉ IP (không xin được Let's Encrypt cho IP LAN).
+	local_certs
+}
+
+# Đổi IP cho khớp máy Ubuntu của bạn. Cổng 8081 là cổng công khai iPhone trỏ vào.
+https://192.168.1.55:8081 {
+	# Server Go chạy HTTP ở localhost:8080 (đặt APP_LISTEN_ADDR=127.0.0.1:8080,
+	# APP_PUBLIC_URL=https://192.168.1.55:8081, để trống APP_TLS_*).
+	reverse_proxy 127.0.0.1:8080
+
+	# Cho upload file lớn (video) — nới giới hạn body.
+	request_body {
+		max_size 5GB
+	}
+}

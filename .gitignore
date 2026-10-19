@@ -1,0 +1,56 @@
+# ===== Dữ liệu backup RAW (KHÔNG commit — ảnh/video gốc + thumbnail) =====
+/data/
+*.part
+*.tmp
+
+# ===== Chứng chỉ / bí mật (KHÔNG commit) =====
+*.pem
+*.key
+*.crt
+*.p12
+*.mobileconfig
+.env
+.env.*
+!/.env.example
+
+# ===== Go =====
+# Binary build ra
+/bin/
+/dist/
+/nextcloud-server
+/server
+/verify
+/reindex
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+vendor/
+# Coverage
+coverage.out
+coverage.html
+
+# ===== Log =====
+*.log
+/logs/
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Ngoại lệ: GIỮ lại các file tham khảo (mẫu handshake) =====
+!/reference/
+!/reference/**
+
+# ===== Source Nextcloud tham khảo (~16k file) — KHÔNG commit vào repo này =====
+# Đây là bản clone chỉ để đối chiếu định dạng handshake; không phải code của dự án.
+/reference/nextcloud-server/
