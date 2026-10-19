@@ -24,7 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 	if cfg.PGDSN == "" {
-		fmt.Fprintln(os.Stderr, "verify cần NCFAKE_PG_DSN trong .env")
+		fmt.Fprintln(os.Stderr, "verify cần APP_PG_DSN trong .env")
 		os.Exit(1)
 	}
 
