@@ -16,6 +16,12 @@ WorkingDirectory=/home/sokoda/projects/photovault
 EnvironmentFile=/home/sokoda/projects/photovault/.env
 ExecStart=/home/sokoda/projects/photovault/bin/pv-server
 
+# Giới hạn RAM: photovault chạy chung máy với Immich. GOMEMLIMIT làm Go GC
+# dọn sớm khi gần 1.5GB; MemoryMax=2G là giới hạn cứng — vượt thì chỉ
+# photovault bị kill và tự restart, không kéo Immich chết theo.
+Environment=GOMEMLIMIT=1536MiB
+MemoryMax=2G
+
 # Tự khởi động lại khi crash; đợi 5s giữa các lần thử.
 Restart=on-failure
 RestartSec=5

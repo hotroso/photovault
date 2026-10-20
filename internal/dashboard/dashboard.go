@@ -5,12 +5,19 @@
 package dashboard
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"html/template"
 	"image"
 	"image/jpeg"
 	_ "image/png"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,15 +32,35 @@ import (
 
 // Dashboard gom phụ thuộc cho các trang xem ảnh.
 type Dashboard struct {
-	cfg     *config.Config
-	store   *storage.Storage
-	pg      *store.Postgres
-	logger  *slog.Logger
+	cfg    *config.Config
+	store  *storage.Storage
+	pg     *store.Postgres
+	logger *slog.Logger
+
+	// thumbSem giới hạn số thumbnail được decode đồng thời. Decode một ảnh
+	// 48MP tốn ~75–200MB RAM; trình duyệt (HTTP/2 qua Caddy) có thể bắn hàng
+	// chục request /thumb cùng lúc → không giới hạn sẽ OOM.
+	thumbSem chan struct{}
 }
+
+const (
+	thumbMaxW        = 300        // chiều rộng thumbnail (px)
+	thumbMaxPixels   = 64_000_000 // từ chối ảnh > 64MP (chống decompression bomb; iPhone 48MP vẫn qua)
+	thumbConcurrency = 2          // số decode chạy song song tối đa
+	thumbCacheDir    = ".thumbs"  // cache trong DataDir; reindex/verify đã bỏ qua thư mục này
+)
+
+var errThumbTooLarge = errors.New("ảnh quá lớn để tạo thumbnail")
 
 // New tạo dashboard.
 func New(cfg *config.Config, st *storage.Storage, pg *store.Postgres, logger *slog.Logger) *Dashboard {
-	return &Dashboard{cfg: cfg, store: st, pg: pg, logger: logger}
+	return &Dashboard{
+		cfg:      cfg,
+		store:    st,
+		pg:       pg,
+		logger:   logger,
+		thumbSem: make(chan struct{}, thumbConcurrency),
+	}
 }
 
 type viewItem struct {
@@ -258,39 +285,139 @@ func (d *Dashboard) TrashRestore(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/dashboard?view=trash", http.StatusSeeOther)
 }
 
-// Thumb phục vụ GET /thumb?path=... — sinh thumbnail JPEG 300px cho ảnh JPEG/PNG.
+// Thumb phục vụ GET /thumb?path=... — thumbnail JPEG 300px cho ảnh JPEG/PNG.
+//
+// Chống quá tải:
+//   - Cache trên đĩa (.thumbs/): mỗi ảnh chỉ decode MỘT lần, các lần xem sau
+//     đọc file nhỏ có sẵn.
+//   - Semaphore: tối đa thumbConcurrency decode cùng lúc; request khác xếp hàng
+//     và tự huỷ nếu trình duyệt bỏ request (cuộn qua).
+//   - DecodeConfig trước: từ chối ảnh quá thumbMaxPixels trước khi cấp phát RAM.
 func (d *Dashboard) Thumb(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Query().Get("path")
 	if rel == "" {
 		http.Error(w, "thiếu path", http.StatusBadRequest)
 		return
 	}
-	f, err := d.store.Open(rel)
-	if err != nil {
+	fi, _, err := d.store.Stat(rel)
+	if err != nil || fi.IsDir() {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
-	defer f.Close()
 
-	src, _, err := image.Decode(f)
+	cacheRel := thumbCacheRel(rel, fi)
+	if d.serveCachedThumb(w, r, cacheRel) {
+		return
+	}
+
+	// Chờ lượt decode; huỷ ngay nếu client đã bỏ request.
+	select {
+	case d.thumbSem <- struct{}{}:
+		defer func() { <-d.thumbSem }()
+	case <-r.Context().Done():
+		return
+	}
+
+	// Trong lúc chờ, một request khác có thể đã sinh xong thumbnail này.
+	if d.serveCachedThumb(w, r, cacheRel) {
+		return
+	}
+
+	data, err := d.renderThumb(rel)
 	if err != nil {
+		if errors.Is(err, errThumbTooLarge) {
+			d.logger.Warn("bỏ qua thumbnail ảnh quá lớn", "rel", rel)
+			http.Error(w, "ảnh quá lớn", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "không decode được ảnh", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	const maxW = 300
-	b := src.Bounds()
-	w2, h2 := b.Dx(), b.Dy()
-	if w2 > maxW {
-		h2 = h2 * maxW / w2
-		w2 = maxW
+	// Ghi cache atomic; lỗi cache không chặn việc trả thumbnail.
+	if _, werr := d.store.WriteAtomic(cacheRel, bytes.NewReader(data), int64(len(data)), time.Time{}); werr != nil {
+		d.logger.Warn("ghi cache thumbnail lỗi", "rel", rel, "err", werr)
 	}
-	dst := image.NewRGBA(image.Rect(0, 0, w2, h2))
-	draw.CatmullRom.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
 
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
-	_ = jpeg.Encode(w, dst, &jpeg.Options{Quality: 80})
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	_, _ = w.Write(data)
+}
+
+// renderThumb decode ảnh gốc và thu nhỏ về thumbMaxW, trả JPEG đã encode.
+func (d *Dashboard) renderThumb(rel string) ([]byte, error) {
+	f, err := d.store.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// Đọc header kích thước trước — rẻ, không decode pixel.
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil {
+		return nil, err
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > thumbMaxPixels {
+		return nil, errThumbTooLarge
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	src, _, err := image.Decode(f)
+	if err != nil {
+		return nil, err
+	}
+
+	b := src.Bounds()
+	w2, h2 := b.Dx(), b.Dy()
+	if w2 > thumbMaxW {
+		h2 = h2 * thumbMaxW / w2
+		w2 = thumbMaxW
+	}
+	if w2 < 1 {
+		w2 = 1
+	}
+	if h2 < 1 {
+		h2 = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, w2, h2))
+	// ApproxBiLinear nhanh hơn CatmullRom nhiều lần; ở kích thước 300px khác
+	// biệt chất lượng gần như không thấy.
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 80}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// serveCachedThumb trả thumbnail đã cache nếu có. Trả false nếu chưa có cache.
+func (d *Dashboard) serveCachedThumb(w http.ResponseWriter, r *http.Request, cacheRel string) bool {
+	cf, err := d.store.Open(cacheRel)
+	if err != nil {
+		return false
+	}
+	defer cf.Close()
+	st, err := cf.Stat()
+	if err != nil || st.Size() == 0 {
+		return false
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeContent(w, r, "", st.ModTime(), cf)
+	return true
+}
+
+// thumbCacheRel tính đường dẫn cache cho thumbnail của rel. Khoá gồm rel + size
+// + mtime nên file đổi nội dung/di chuyển sẽ sinh thumbnail mới. Chia thư mục con
+// theo 2 ký tự đầu để tránh một thư mục chứa hàng chục nghìn file.
+func thumbCacheRel(rel string, fi os.FileInfo) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", rel, fi.Size(), fi.ModTime().UnixNano())))
+	key := hex.EncodeToString(sum[:16])
+	return thumbCacheDir + "/" + key[:2] + "/" + key + ".jpg"
 }
 
 // Media phục vụ GET /media?path=... — trả file gốc (xem full-res / tải video).
