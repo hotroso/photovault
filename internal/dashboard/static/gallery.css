@@ -60,22 +60,40 @@
   display: none;
 }
 
-/* Ô thay thế cho video / HEIC (chưa có thumbnail). */
+/* Lớp dưới cùng: nền + đuôi file, hiện khi thumbnail chưa tải / không có. */
 .jg-ph {
+  position: absolute;
+  inset: 0;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  width: 100%;
-  height: 100%;
-  background: linear-gradient(135deg, #334155, #1e293b);
+  background: linear-gradient(135deg, #cbd5e1, #94a3b8);
   color: #fff;
 }
 
+.jg-tile img {
+  position: relative;
+}
+
+/* Nút play nổi trên ảnh bìa video. */
 .jg-play {
-  font-size: 1.8rem;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding-left: 3px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 1rem;
   line-height: 1;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
 
 .jg-ext {

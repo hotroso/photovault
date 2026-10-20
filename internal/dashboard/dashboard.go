@@ -46,6 +46,8 @@ type Dashboard struct {
 	// 48MP tốn ~75–200MB RAM; trình duyệt (HTTP/2 qua Caddy) có thể bắn hàng
 	// chục request /thumb cùng lúc → không giới hạn sẽ OOM.
 	thumbSem chan struct{}
+
+	tools thumbTools // vipsthumbnail/ffmpeg tìm thấy lúc khởi động
 }
 
 const (
@@ -83,12 +85,15 @@ var errThumbTooLarge = errors.New("ảnh quá lớn để tạo thumbnail")
 
 // New tạo dashboard.
 func New(cfg *config.Config, st *storage.Storage, pg *store.Postgres, logger *slog.Logger) *Dashboard {
+	tools := detectThumbTools()
+	logger.Info("công cụ thumbnail", "vipsthumbnail", tools.vips != "", "ffmpeg", tools.ffmpeg != "")
 	return &Dashboard{
 		cfg:      cfg,
 		store:    st,
 		pg:       pg,
 		logger:   logger,
 		thumbSem: make(chan struct{}, thumbConcurrency),
+		tools:    tools,
 	}
 }
 
@@ -236,7 +241,7 @@ func (d *Dashboard) Index(w http.ResponseWriter, r *http.Request) {
 				Name:    p.OriginalName,
 				SizeKB:  p.Size / 1024,
 				TakenAt: p.TakenAt.Local().Format("2006-01-02 15:04"),
-				IsImage: isThumbnailable(p.MIME),
+				IsImage: d.canThumb(p.MIME),
 				MIME:    p.MIME,
 				IsTrash: true,
 				DupInfo: dupInfo,
@@ -265,7 +270,8 @@ type apiPhoto struct {
 	Taken  string `json:"taken"`  // "2006-01-02T15:04" giờ địa phương (7 ký tự đầu = khoá tháng)
 	Label  string `json:"label"`  // ngày giờ hiển thị
 	SizeKB int64  `json:"sizeKB"` // dung lượng
-	Kind   string `json:"kind"`   // "image" (có thumbnail) | "video" | "other"
+	Kind   string `json:"kind"`   // "image" | "video" | "other"
+	Thumb  bool   `json:"thumb"`  // có /thumb (ảnh, HEIC qua vips, ảnh bìa video qua ffmpeg)
 	W      int    `json:"w"`      // kích thước hiển thị đã xoay EXIF; 0 = không rõ
 	H      int    `json:"h"`
 }
@@ -329,6 +335,7 @@ func (d *Dashboard) APIPhotos(w http.ResponseWriter, r *http.Request) {
 			Label:  t.Format("02/01/2006 15:04"),
 			SizeKB: p.Size / 1024,
 			Kind:   mediaKind(p.MIME),
+			Thumb:  d.canThumb(p.MIME) && p.Width >= 0,
 		}
 		if p.Width > 0 && p.Height > 0 {
 			item.W, item.H = p.Width, p.Height
@@ -403,12 +410,13 @@ func (d *Dashboard) measure(rel string) (int, int) {
 	return cfg.Width, cfg.Height
 }
 
-// mediaKind phân loại để gallery biết hiện thumbnail hay ô thay thế.
+// mediaKind phân loại để gallery biết cách hiển thị (ảnh / video có nút play).
 func mediaKind(mime string) string {
+	m := strings.ToLower(mime)
 	switch {
-	case isThumbnailable(mime):
+	case strings.HasPrefix(m, "image/"):
 		return "image"
-	case strings.HasPrefix(strings.ToLower(mime), "video/"):
+	case strings.HasPrefix(m, "video/"):
 		return "video"
 	default:
 		return "other"
@@ -488,7 +496,7 @@ func (d *Dashboard) Thumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "thiếu path", http.StatusBadRequest)
 		return
 	}
-	fi, _, err := d.store.Stat(rel)
+	fi, srcAbs, err := d.store.Stat(rel)
 	if err != nil || fi.IsDir() {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
@@ -496,6 +504,12 @@ func (d *Dashboard) Thumb(w http.ResponseWriter, r *http.Request) {
 
 	cacheRel := thumbCacheRel(rel, fi)
 	if d.serveCachedThumb(w, r, cacheRel) {
+		return
+	}
+
+	mime := mimeByExt(rel)
+	if !d.canThumb(mime) {
+		http.Error(w, "định dạng không có thumbnail", http.StatusUnsupportedMediaType)
 		return
 	}
 
@@ -512,26 +526,24 @@ func (d *Dashboard) Thumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := d.renderThumb(rel)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), thumbTimeout)
+	defer cancel()
+	if err := d.ensureThumb(ctx, rel, srcAbs, mime, fi, false); err != nil {
+		if r.Context().Err() != nil {
+			return // client đã bỏ request (cuộn qua)
+		}
 		if errors.Is(err, errThumbTooLarge) {
 			d.logger.Warn("bỏ qua thumbnail ảnh quá lớn", "rel", rel)
 			http.Error(w, "ảnh quá lớn", http.StatusRequestEntityTooLarge)
 			return
 		}
-		http.Error(w, "không decode được ảnh", http.StatusUnsupportedMediaType)
+		d.logger.Warn("tạo thumbnail lỗi", "rel", rel, "err", err)
+		http.Error(w, "không tạo được thumbnail", http.StatusUnsupportedMediaType)
 		return
 	}
-
-	// Ghi cache atomic; lỗi cache không chặn việc trả thumbnail.
-	if _, werr := d.store.WriteAtomic(cacheRel, bytes.NewReader(data), int64(len(data)), time.Time{}); werr != nil {
-		d.logger.Warn("ghi cache thumbnail lỗi", "rel", rel, "err", werr)
+	if !d.serveCachedThumb(w, r, cacheRel) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
-
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	_, _ = w.Write(data)
 }
 
 // renderThumb decode ảnh gốc, thu nhỏ về cao thumbHeight, xoay theo EXIF

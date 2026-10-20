@@ -500,6 +500,33 @@ func (s *Storage) CleanupStale(maxAge time.Duration) (int, error) {
 			}
 		}
 	}
+
+	// File tạm của thumbnail (.thumbs/<xx>/*.tmp.jpg) còn sót khi tiến trình bị kill.
+	thumbsAbs := filepath.Join(s.root, ".thumbs")
+	shards, err := os.ReadDir(thumbsAbs)
+	if err != nil && !os.IsNotExist(err) {
+		return removed, err
+	}
+	for _, sh := range shards {
+		if !sh.IsDir() {
+			continue
+		}
+		dir := filepath.Join(thumbsAbs, sh.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".tmp.jpg") {
+				continue
+			}
+			if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+				if err := os.Remove(filepath.Join(dir, e.Name())); err == nil {
+					removed++
+				}
+			}
+		}
+	}
 	return removed, nil
 }
 

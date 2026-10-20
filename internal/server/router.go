@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -67,6 +68,8 @@ func NewRouter(d Deps) http.Handler {
 
 	// ---- M5: Dashboard ----
 	dash := dashboard.New(cfg, d.Storage, d.PG, logger)
+	// Sinh sẵn thumbnail nền (nice 19) để mở dashboard hầu như chỉ đọc cache.
+	dash.StartWarmer(context.Background())
 	mux.HandleFunc("GET /dashboard", dash.Index)
 	mux.HandleFunc("GET /api/photos", dash.APIPhotos)
 	mux.Handle("GET /static/", dashboard.StaticHandler())

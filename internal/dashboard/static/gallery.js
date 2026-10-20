@@ -31,6 +31,32 @@
   let layout = { blocks: [], height: 0, width: 0 };
   const live = new Map(); // khoá → phần tử đang có trên DOM
 
+  // Tải theo viewport: ô được tạo sẵn trong vùng đệm (rẻ, chỉ là thẻ rỗng),
+  // nhưng ảnh CHỈ được request khi ô sắp vào màn hình (cách 300px). Cuộn nhanh
+  // qua thì ô bị gỡ trước khi kịp request → server không phải làm vô ích.
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        io.unobserve(e.target);
+        const img = e.target.querySelector('img[data-src]');
+        if (img) {
+          img.src = img.dataset.src;
+          delete img.dataset.src;
+        }
+      }
+    },
+    { rootMargin: '300px 0px' }
+  );
+
+  // Gỡ ô khỏi DOM; ảnh đang tải dở thì huỷ request luôn.
+  function dropTile(el) {
+    io.unobserve(el);
+    const img = el.querySelector('img');
+    if (img && !img.complete) img.removeAttribute('src');
+    el.remove();
+  }
+
   const rowHeightFor = (w) => (w < 600 ? 120 : w < 1100 ? 180 : 230);
   const ratioOf = (it) => (it.w > 0 && it.h > 0 ? it.w / it.h : 1);
   const thumbURL = (it) => '/thumb?path=' + encodeURIComponent(it.path);
@@ -140,29 +166,32 @@
     a.rel = 'noopener';
     a.dataset.idx = String(idx);
     a.title = it.name;
-    if (it.kind === 'image') {
+
+    // Ô thay thế nằm dưới cùng: hiện khi chưa có / không có thumbnail.
+    const ph = document.createElement('span');
+    ph.className = 'jg-ph';
+    const ext = document.createElement('span');
+    ext.className = 'jg-ext';
+    ext.textContent = extOf(it.name);
+    ph.appendChild(ext);
+    a.appendChild(ph);
+
+    if (it.thumb) {
       const img = document.createElement('img');
       img.decoding = 'async';
       img.alt = it.name;
       img.addEventListener('load', () => a.classList.add('loaded'), { once: true });
       img.addEventListener('error', () => a.classList.add('broken'), { once: true });
-      img.src = thumbURL(it);
+      img.dataset.src = thumbURL(it); // request khi vào viewport (xem io ở trên)
       a.appendChild(img);
-    } else {
-      const ph = document.createElement('span');
-      ph.className = 'jg-ph';
-      if (it.kind === 'video') {
-        const play = document.createElement('span');
-        play.className = 'jg-play';
-        play.setAttribute('aria-hidden', 'true');
-        play.textContent = '▶';
-        ph.appendChild(play);
-      }
-      const ext = document.createElement('span');
-      ext.className = 'jg-ext';
-      ext.textContent = extOf(it.name);
-      ph.appendChild(ext);
-      a.appendChild(ph);
+      io.observe(a);
+    }
+    if (it.kind === 'video') {
+      const play = document.createElement('span');
+      play.className = 'jg-play';
+      play.setAttribute('aria-hidden', 'true');
+      play.textContent = '▶';
+      a.appendChild(play);
     }
     const cap = document.createElement('span');
     cap.className = 'jg-cap';
@@ -173,7 +202,7 @@
 
   function render() {
     const top = rootTop();
-    const buffer = window.innerHeight * 1.5;
+    const buffer = window.innerHeight; // vùng đệm DOM (ảnh chỉ tải khi vào viewport)
     const from = window.scrollY - top - buffer;
     const to = window.scrollY - top + window.innerHeight + buffer;
     const keep = new Set();
@@ -209,7 +238,7 @@
     // Gỡ phần tử ra xa màn hình → trình duyệt huỷ tải/giải phóng ảnh.
     for (const [key, el] of live) {
       if (!keep.has(key)) {
-        el.remove();
+        dropTile(el);
         live.delete(key);
       }
     }
@@ -353,12 +382,14 @@
       el.playsInline = true;
       el.preload = 'metadata';
       el.src = mediaURL(it);
+      if (it.thumb) el.poster = thumbURL(it);
     } else {
       el = document.createElement('img');
       el.alt = it.name;
       el.decoding = 'async';
-      if (it.kind === 'image') {
+      if (it.thumb) {
         // Hiện thumbnail (đã cache) ngay, rồi thay bằng ảnh gốc khi tải xong.
+        // Ảnh gốc trình duyệt không đọc được (HEIC trên Chrome) → giữ thumbnail.
         el.src = thumbURL(it);
         const full = new Image();
         full.addEventListener('load', () => {
@@ -366,7 +397,6 @@
         });
         full.src = mediaURL(it);
       } else {
-        // HEIC...: Safari xem được, trình duyệt khác thì báo không hỗ trợ.
         el.addEventListener('error', () => el.replaceWith(unsupported(it)), { once: true });
         el.src = mediaURL(it);
       }

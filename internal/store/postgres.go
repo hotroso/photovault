@@ -469,6 +469,19 @@ LIMIT $5;
 	return out, rows.Err()
 }
 
+// SetDimensionsIfUnknown lưu kích thước cho rel_path CHỈ KHI chưa có kích thước
+// hợp lệ (width <= 0). Dùng khi sinh thumbnail: không ghi đè số đo chính xác
+// từ header ảnh; -1 đánh dấu "không tạo được thumbnail" để bộ sinh nền bỏ qua.
+func (p *Postgres) SetDimensionsIfUnknown(ctx context.Context, relPath string, width, height int) error {
+	if !p.enabled() {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx,
+		`UPDATE photos SET width = $2, height = $3 WHERE rel_path = $1 AND width <= 0;`,
+		relPath, width, height)
+	return err
+}
+
 // SetDimensions lưu kích thước hiển thị đã đo của một ảnh (-1,-1 = không đo được).
 func (p *Postgres) SetDimensions(ctx context.Context, id int64, width, height int) error {
 	if !p.enabled() {
