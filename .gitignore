@@ -57,3 +57,4 @@ Thumbs.db
 
 # ===== Workflow/agent task metadata (KHÔNG commit — chỉ là bookkeeping nội bộ) =====
 /.agents/
+.reference/
