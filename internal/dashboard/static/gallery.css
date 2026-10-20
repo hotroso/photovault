@@ -1,0 +1,264 @@
+/* Gallery justified + lightbox cho PhotoVault. */
+
+.jg-wrap {
+  padding: 12px 16px 40px;
+}
+
+#gallery {
+  position: relative;
+}
+
+.jg-canvas {
+  position: relative;
+  width: 100%;
+}
+
+/* Ảnh và tiêu đề tháng được đặt tuyệt đối bằng transform (gallery.js). */
+.jg-tile,
+.jg-month {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.jg-tile {
+  display: block;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #e5e7eb;
+  color: inherit;
+  text-decoration: none;
+}
+
+.jg-tile:focus-visible {
+  outline: 3px solid #2563eb;
+  outline-offset: 2px;
+  z-index: 1;
+}
+
+.jg-tile img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition:
+    opacity 0.25s ease,
+    transform 0.3s ease;
+}
+
+.jg-tile.loaded img {
+  opacity: 1;
+}
+
+.jg-tile:hover img {
+  transform: scale(1.03);
+}
+
+/* Ảnh không tạo được thumbnail (quá lớn/lỗi): ẩn ảnh vỡ, hiện nền xám. */
+.jg-tile.broken img {
+  display: none;
+}
+
+/* Ô thay thế cho video / HEIC (chưa có thumbnail). */
+.jg-ph {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #334155, #1e293b);
+  color: #fff;
+}
+
+.jg-play {
+  font-size: 1.8rem;
+  line-height: 1;
+}
+
+.jg-ext {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  opacity: 0.8;
+}
+
+.jg-cap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 18px 8px 6px;
+  overflow: hidden;
+  color: #fff;
+  font-size: 0.72rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.65));
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
+.jg-tile:hover .jg-cap,
+.jg-tile:focus-visible .jg-cap {
+  opacity: 1;
+}
+
+.jg-month {
+  right: 0;
+  display: flex;
+  align-items: flex-end;
+  margin: 0;
+  padding-bottom: 8px;
+  box-sizing: border-box;
+  color: #1f2937;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+#gallery-status {
+  margin: 0;
+  padding: 16px;
+  color: #6b7280;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+/* ---- Lightbox ---- */
+
+.lb {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 10, 12, 0.94);
+}
+
+.lb[hidden] {
+  display: none;
+}
+
+.lb-stage {
+  position: absolute;
+  inset: 56px 72px 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lb-stage img,
+.lb-stage video {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+.lb-msg {
+  max-width: 28rem;
+  color: #e5e7eb;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.lb-btn {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 1.4rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lb-btn:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.lb-btn:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+.lb-btn:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.lb-close {
+  top: 12px;
+  right: 12px;
+}
+
+.lb-prev,
+.lb-next {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.lb-prev {
+  left: 14px;
+}
+
+.lb-next {
+  right: 14px;
+}
+
+.lb-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 14px 20px;
+  color: #d1d5db;
+  font-size: 0.85rem;
+}
+
+.lb-open {
+  flex-shrink: 0;
+  color: #93c5fd;
+}
+
+body.lb-active {
+  overflow: hidden;
+}
+
+@media (max-width: 600px) {
+  .jg-wrap {
+    padding: 8px 8px 32px;
+  }
+
+  .lb-stage {
+    inset: 56px 8px 64px;
+  }
+
+  .lb-prev,
+  .lb-next {
+    top: auto;
+    bottom: 60px;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jg-tile img,
+  .jg-cap {
+    transition: none;
+  }
+
+  .jg-tile:hover img {
+    transform: none;
+  }
+}

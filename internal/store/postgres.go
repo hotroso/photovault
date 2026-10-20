@@ -28,6 +28,11 @@ type Photo struct {
 	IsTrash      bool   // true nếu nằm trong thùng rác (recyclebin/) do trùng file
 	DupOf        *int64 // ID bản gốc mà file này trùng (nil nếu là bản gốc)
 	LogicalPath  string // M2: đường dẫn app nhìn thấy, ví dụ "me/Photos/IMG_0001.jpg"
+
+	// Kích thước hiển thị (đã xoay theo EXIF) cho bố cục gallery. 0 = chưa đo,
+	// -1 = không đo được (video/HEIC/ảnh lỗi). CHỈ ListPage nạp hai trường này.
+	Width  int
+	Height int
 }
 
 // Postgres bọc connection pool và các thao tác chỉ mục.
@@ -90,6 +95,11 @@ CREATE INDEX IF NOT EXISTS photos_sha256_idx ON photos (sha256);
 -- thư mục mà app đã upload. Index phục vụ tra cứu theo tiền tố thư mục.
 ALTER TABLE photos ADD COLUMN IF NOT EXISTS logical_path TEXT;
 CREATE INDEX IF NOT EXISTS photos_logical_path_idx ON photos (logical_path);
+-- Gallery: kích thước ảnh (đo lười lúc xem, lưu lại để không đo lần hai) và
+-- index cho phân trang keyset (taken_at, id) trên ảnh không-rác.
+ALTER TABLE photos ADD COLUMN IF NOT EXISTS width INT NOT NULL DEFAULT 0;
+ALTER TABLE photos ADD COLUMN IF NOT EXISTS height INT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS photos_active_taken_idx ON photos (taken_at DESC, id DESC) WHERE is_trash = false;
 `
 	_, err := p.pool.Exec(ctx, schema)
 	return err
@@ -412,6 +422,70 @@ func (p *Postgres) DeleteNotIn(ctx context.Context, keep map[string]struct{}) (i
 		n += ct.RowsAffected()
 	}
 	return n, nil
+}
+
+// PageCursor là vị trí phân trang keyset: lấy các ảnh "cũ hơn" (taken_at, id).
+type PageCursor struct {
+	TakenAt time.Time
+	ID      int64
+}
+
+// ListPage trả một trang ảnh không-rác, mới nhất trước, dùng phân trang keyset
+// (không OFFSET) nên trang thứ 200 vẫn nhanh như trang đầu. after=nil → trang
+// đầu. from/to (nil = không lọc) giới hạn taken_at trong [from, to).
+func (p *Postgres) ListPage(ctx context.Context, after *PageCursor, from, to *time.Time, limit int) ([]Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	var afterTaken *time.Time
+	var afterID int64
+	if after != nil {
+		afterTaken, afterID = &after.TakenAt, after.ID
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at, width, height
+FROM photos
+WHERE is_trash = false
+  AND ($1::timestamptz IS NULL OR (taken_at, id) < ($1::timestamptz, $2::bigint))
+  AND ($3::timestamptz IS NULL OR taken_at >= $3::timestamptz)
+  AND ($4::timestamptz IS NULL OR taken_at < $4::timestamptz)
+ORDER BY taken_at DESC, id DESC
+LIMIT $5;
+`
+	rows, err := p.pool.Query(ctx, q, afterTaken, afterID, from, to, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Photo
+	for rows.Next() {
+		var ph Photo
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt, &ph.Width, &ph.Height); err != nil {
+			return nil, err
+		}
+		out = append(out, ph)
+	}
+	return out, rows.Err()
+}
+
+// SetDimensions lưu kích thước hiển thị đã đo của một ảnh (-1,-1 = không đo được).
+func (p *Postgres) SetDimensions(ctx context.Context, id int64, width, height int) error {
+	if !p.enabled() {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx, `UPDATE photos SET width = $2, height = $3 WHERE id = $1;`, id, width, height)
+	return err
+}
+
+// CountByTrash đếm số bản ghi trong thùng rác (trash=true) hoặc ảnh thường (false).
+func (p *Postgres) CountByTrash(ctx context.Context, trash bool) (int64, error) {
+	if !p.enabled() {
+		return 0, nil
+	}
+	var n int64
+	err := p.pool.QueryRow(ctx, `SELECT count(*) FROM photos WHERE is_trash = $1;`, trash).Scan(&n)
+	return n, err
 }
 
 // Count trả tổng số ảnh đã index.

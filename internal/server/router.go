@@ -68,6 +68,8 @@ func NewRouter(d Deps) http.Handler {
 	// ---- M5: Dashboard ----
 	dash := dashboard.New(cfg, d.Storage, d.PG, logger)
 	mux.HandleFunc("GET /dashboard", dash.Index)
+	mux.HandleFunc("GET /api/photos", dash.APIPhotos)
+	mux.Handle("GET /static/", dashboard.StaticHandler())
 	mux.HandleFunc("GET /thumb", dash.Thumb)
 	mux.HandleFunc("GET /media", dash.Media)
 	mux.HandleFunc("POST /trash/delete", dash.TrashDelete)
