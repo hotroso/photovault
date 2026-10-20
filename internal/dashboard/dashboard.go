@@ -496,6 +496,42 @@ func (d *Dashboard) Thumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "thiếu path", http.StatusBadRequest)
 		return
 	}
+	d.serveThumb(w, r, rel)
+}
+
+// CanThumb cho biết có tạo được preview cho MIME này không (WebDAV dùng để báo
+// nc:has-preview cho app).
+func (d *Dashboard) CanThumb(mime string) bool { return d.canThumb(mime) }
+
+// Preview phục vụ GET /index.php/core/preview?fileId=... — endpoint preview của
+// Nextcloud mà app iOS gọi cho lưới ảnh. fileId là id ảnh trong DB (oc:fileid
+// trong PROPFIND/SEARCH). Trả thumbnail đã cache (cao 360px); x/y/a/mode của
+// app được bỏ qua — app tự co giãn/cắt khi hiển thị.
+func (d *Dashboard) Preview(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.URL.Query().Get("fileId"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "thiếu fileId", http.StatusBadRequest)
+		return
+	}
+	p, err := d.pg.GetByID(r.Context(), id)
+	if err != nil {
+		d.logger.Error("tra ảnh cho preview lỗi", "fileId", id, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if p == nil || p.IsTrash {
+		http.NotFound(w, r)
+		return
+	}
+	// ETag theo nội dung để app cache được (gửi If-None-Match lần sau → 304).
+	if len(p.SHA256) >= 16 {
+		w.Header().Set("ETag", `"`+p.SHA256[:16]+`"`)
+	}
+	d.serveThumb(w, r, p.RelPath)
+}
+
+// serveThumb trả thumbnail của rel: đọc cache, chưa có thì sinh (giới hạn đồng thời).
+func (d *Dashboard) serveThumb(w http.ResponseWriter, r *http.Request, rel string) {
 	fi, srcAbs, err := d.store.Stat(rel)
 	if err != nil || fi.IsDir() {
 		http.Error(w, "Not Found", http.StatusNotFound)

@@ -469,6 +469,41 @@ LIMIT $5;
 	return out, rows.Err()
 }
 
+// SearchMedia phục vụ WebDAV SEARCH (tab Media của app): ảnh/video không-rác có
+// logical_path bắt đầu bằng prefix (đã kèm "/"), taken_at trong [from, to]
+// (nil = không giới hạn), mới nhất trước.
+func (p *Postgres) SearchMedia(ctx context.Context, prefix string, from, to *time.Time, limit int) ([]Photo, error) {
+	if !p.enabled() {
+		return nil, nil
+	}
+	const q = `
+SELECT id, rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, COALESCE(logical_path,'') AS logical_path, uploaded_at, width, height
+FROM photos
+WHERE is_trash = false
+  AND logical_path LIKE $1
+  AND (mime LIKE 'image/%' OR mime LIKE 'video/%')
+  AND ($2::timestamptz IS NULL OR taken_at >= $2::timestamptz)
+  AND ($3::timestamptz IS NULL OR taken_at <= $3::timestamptz)
+ORDER BY taken_at DESC, id DESC
+LIMIT $4;
+`
+	rows, err := p.pool.Query(ctx, q, escapeLike(prefix)+"%", from, to, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Photo
+	for rows.Next() {
+		var ph Photo
+		if err := rows.Scan(&ph.ID, &ph.RelPath, &ph.OriginalName, &ph.Size, &ph.SHA256, &ph.TakenAt, &ph.MIME, &ph.IsTrash, &ph.DupOf, &ph.LogicalPath, &ph.UploadedAt, &ph.Width, &ph.Height); err != nil {
+			return nil, err
+		}
+		out = append(out, ph)
+	}
+	return out, rows.Err()
+}
+
 // SetDimensionsIfUnknown lưu kích thước cho rel_path CHỈ KHI chưa có kích thước
 // hợp lệ (width <= 0). Dùng khi sinh thumbnail: không ghi đè số đo chính xác
 // từ header ảnh; -1 đánh dấu "không tạo được thumbnail" để bộ sinh nền bỏ qua.

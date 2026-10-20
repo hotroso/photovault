@@ -39,6 +39,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /ocs/v2.php/cloud/capabilities", compat.Capabilities(cfg, logger))
 	mux.HandleFunc("GET /ocs/v1.php/cloud/user", compat.User(cfg, logger))
 	mux.HandleFunc("GET /ocs/v2.php/cloud/user", compat.User(cfg, logger))
+	mux.HandleFunc("GET /ocs/v1.php/cloud/users/{userid}", compat.UserDetail(cfg, logger))
+	mux.HandleFunc("GET /ocs/v2.php/cloud/users/{userid}", compat.UserDetail(cfg, logger))
 
 	// ---- M2: Login Flow v2 ----
 	lf := compat.NewLoginFlow(cfg, d.Redis, logger)
@@ -70,6 +72,17 @@ func NewRouter(d Deps) http.Handler {
 	dash := dashboard.New(cfg, d.Storage, d.PG, logger)
 	// Sinh sẵn thumbnail nền (nice 19) để mở dashboard hầu như chỉ đọc cache.
 	dash.StartWarmer(context.Background())
+
+	// ---- M6: xem ảnh trong app (tab Media + lưới Files) ----
+	// SEARCH liệt kê media; core/preview trả thumbnail theo fileId (dùng chung
+	// cache thumbnail với dashboard). Cả hai cần app password như WebDAV.
+	dav.SetPreviewSupport(dash.CanThumb)
+	search := verifier.RequireBasicAuth(logger, http.HandlerFunc(dav.ServeSearch))
+	mux.Handle("/remote.php/dav", search)
+	mux.Handle("/remote.php/dav/{$}", search)
+	preview := verifier.RequireBasicAuth(logger, http.HandlerFunc(dash.Preview))
+	mux.Handle("GET /index.php/core/preview", preview)
+	mux.Handle("GET /core/preview", preview)
 	mux.HandleFunc("GET /dashboard", dash.Index)
 	mux.HandleFunc("GET /api/photos", dash.APIPhotos)
 	mux.Handle("GET /static/", dashboard.StaticHandler())

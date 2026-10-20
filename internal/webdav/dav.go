@@ -7,9 +7,12 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -34,7 +37,14 @@ type Handler struct {
 	// chưa tồn tại và cả hai vào photos/. Bước stream dữ liệu (StageTemp) nằm
 	// NGOÀI khoá nên upload vẫn song song; phần trong khoá chỉ vài mili-giây.
 	dedupMu sync.Mutex
+
+	// hasPreview cho biết có tạo được preview cho một MIME không (do dashboard
+	// cung cấp, vì bộ sinh thumbnail nằm ở đó). nil = không có preview.
+	hasPreview func(mime string) bool
 }
+
+// SetPreviewSupport gắn hàm kiểm tra preview để PROPFIND/SEARCH báo nc:has-preview.
+func (h *Handler) SetPreviewSupport(f func(mime string) bool) { h.hasPreview = f }
 
 // NewHandler tạo WebDAV handler.
 func NewHandler(cfg *config.Config, st *storage.Storage, pg *store.Postgres, logger *slog.Logger) *Handler {
@@ -63,6 +73,19 @@ func (h *Handler) ServeFiles(w http.ResponseWriter, r *http.Request) {
 		h.delete(w, r, rel)
 	case "HEAD", "GET":
 		h.get(w, r, rel)
+	case "REPORT":
+		// App dùng REPORT oc:filter-files để lấy danh sách yêu thích. Server không
+		// có tính năng yêu thích → trả danh sách rỗng thay vì 405.
+		writeMultistatus(w, h.logger, newMultistatus())
+	case "PROPPATCH":
+		// App đặt thuộc tính (yêu thích, live photo...). Không lưu, nhưng báo thành
+		// công để app không coi là lỗi và thử lại.
+		ms := newMultistatus()
+		ms.Responses = append(ms.Responses, davResponse{
+			Href:     r.URL.Path,
+			Propstat: davPropstat{Status: "HTTP/1.1 200 OK"},
+		})
+		writeMultistatus(w, h.logger, ms)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -100,12 +123,62 @@ type davPropstat struct {
 	Status string  `xml:"d:status"`
 }
 
+// davProp là các thuộc tính trả cho app. Tên kèm tiền tố (d:/oc:/nc:) ghi
+// nguyên văn vì app iOS (SwiftyXMLParser) tra cứu đúng các tên có tiền tố này.
 type davProp struct {
+	DisplayName   string        `xml:"d:displayname,omitempty"`
 	ResourceType  *resourceType `xml:"d:resourcetype"`
 	ContentLength *int64        `xml:"d:getcontentlength,omitempty"`
 	ContentType   string        `xml:"d:getcontenttype,omitempty"`
 	LastModified  string        `xml:"d:getlastmodified,omitempty"`
 	ETag          string        `xml:"d:getetag,omitempty"`
+	// oc:id là khoá chính của file trong DB của app; oc:fileid dùng để gọi
+	// /index.php/core/preview?fileId=. Thiếu hai trường này app không xem được ảnh.
+	ID          string `xml:"oc:id,omitempty"`
+	FileID      string `xml:"oc:fileid,omitempty"`
+	Permissions string `xml:"oc:permissions,omitempty"`
+	Size        *int64 `xml:"oc:size,omitempty"`
+	HasPreview  string `xml:"nc:has-preview,omitempty"`
+	UploadTime  int64  `xml:"nc:upload_time,omitempty"`
+}
+
+// instanceID ghép sau fileid để tạo oc:id (giống Nextcloud: "%08d" + instanceid).
+const instanceID = "ocpvault1"
+
+// dirFileIDBase tách không gian id của thư mục ảo khỏi id ảnh (id ảnh là
+// identity của Postgres, nhỏ hơn nhiều).
+const dirFileIDBase = 2_000_000_000
+
+func ocID(fileID int64) string { return fmt.Sprintf("%08d%s", fileID, instanceID) }
+
+// dirFileID tạo id ổn định cho một thư mục ảo từ đường dẫn logic.
+func dirFileID(logical string) int64 {
+	f := fnv.New32a()
+	_, _ = f.Write([]byte(strings.Trim(logical, "/")))
+	return dirFileIDBase + int64(f.Sum32()%1_000_000_000)
+}
+
+// davHref tạo href WebDAV cho một đường dẫn logic ("me/Photos/a b.jpg"), mã
+// hoá từng đoạn. Thư mục kết thúc bằng "/" (app nhận diện thư mục gốc bằng
+// href "/remote.php/dav/files/<user>/").
+func davHref(logical string, dir bool) string {
+	segs := strings.Split(strings.Trim(logical, "/"), "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	h := "/remote.php/dav/files/" + strings.Join(segs, "/")
+	if dir {
+		h += "/"
+	}
+	return h
+}
+
+func newMultistatus() multistatus {
+	return multistatus{
+		XMLNSD:  "DAV:",
+		XMLNSOC: "http://owncloud.org/ns",
+		XMLNSNC: "http://nextcloud.org/ns",
+	}
 }
 
 type resourceType struct {
@@ -118,45 +191,71 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, rel string) {
 		depth = "1"
 	}
 
-	ms := multistatus{
-		XMLNSD:  "DAV:",
-		XMLNSOC: "http://owncloud.org/ns",
-		XMLNSNC: "http://nextcloud.org/ns",
-	}
-
+	ms := newMultistatus()
 	ctx := r.Context()
+	rel = strings.Trim(rel, "/")
 
 	// M2 — ánh xạ hai chiều: cây thư mục trả cho app được dựng từ logical_path
 	// trong DB, KHÔNG đọc cây thư mục vật lý (file thật nằm ở photos/<yyyymm>/).
 
 	// (1) rel trỏ tới một FILE đã upload? → trả metadata thật của file đó.
 	if ph, err := h.pg.GetByLogicalPath(ctx, rel); err == nil && ph != nil {
-		ms.Responses = append(ms.Responses, h.responseForPhoto(r.URL.Path, ph))
+		ms.Responses = append(ms.Responses, h.responseForPhoto(davHref(rel, false), ph))
 		writeMultistatus(w, h.logger, ms)
 		return
 	}
 
 	// (2) rel là một THƯ MỤC: trả chính nó + (nếu Depth≥1) các con trực tiếp.
-	ms.Responses = append(ms.Responses, dirResponse(r.URL.Path))
+	// Danh sách hậu duệ dùng cả để tính ETag thư mục: ETag đổi khi có ảnh mới,
+	// nhờ đó app biết cần tải lại danh sách.
+	descendants, err := h.pg.ListByLogicalPrefix(ctx, rel+"/", 50000)
+	if err != nil {
+		h.logger.Warn("PROPFIND liệt kê con lỗi", "rel", rel, "err", err)
+	}
+	selfTag, subTags := dirETags(rel, descendants)
+	ms.Responses = append(ms.Responses, dirResponse(rel, selfTag))
 
 	if depth != "0" {
-		prefix := strings.TrimSuffix(rel, "/") + "/"
-		children, err := h.pg.ListByLogicalPrefix(ctx, prefix, 10000)
-		if err != nil {
-			h.logger.Warn("PROPFIND liệt kê con lỗi", "rel", rel, "err", err)
-		}
-		for _, c := range immediateChildren(rel, children) {
-			childURL := path.Join(r.URL.Path, c.name)
+		for _, c := range immediateChildren(rel, descendants) {
+			child := rel + "/" + c.name
 			if c.isDir {
-				childURL += "/"
-				ms.Responses = append(ms.Responses, dirResponse(childURL))
+				ms.Responses = append(ms.Responses, dirResponse(child, subTags[c.name]))
 			} else {
-				ms.Responses = append(ms.Responses, h.responseForPhoto(childURL, c.photo))
+				ms.Responses = append(ms.Responses, h.responseForPhoto(davHref(child, false), c.photo))
 			}
 		}
 	}
 
 	writeMultistatus(w, h.logger, ms)
+}
+
+// dirETags tính ETag cho thư mục dir và cho từng thư mục con trực tiếp, từ
+// danh sách hậu duệ (logical_path + sha256). Thêm/xoá/đổi tên ảnh → ETag đổi.
+func dirETags(dir string, photos []store.Photo) (string, map[string]string) {
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	self := fnv.New64a()
+	subs := map[string]hash.Hash64{}
+	for _, p := range photos {
+		rest, ok := strings.CutPrefix(p.LogicalPath, prefix)
+		if !ok || rest == "" {
+			continue
+		}
+		line := p.LogicalPath + "|" + p.SHA256 + "\n"
+		_, _ = self.Write([]byte(line))
+		if seg, _, isDir := strings.Cut(rest, "/"); isDir && seg != "" {
+			hs, ok := subs[seg]
+			if !ok {
+				hs = fnv.New64a()
+				subs[seg] = hs
+			}
+			_, _ = hs.Write([]byte(line))
+		}
+	}
+	out := make(map[string]string, len(subs))
+	for seg, hs := range subs {
+		out[seg] = fmt.Sprintf("%016x", hs.Sum64())
+	}
+	return fmt.Sprintf("%016x", self.Sum64()), out
 }
 
 // childEntry là một mục con trực tiếp của thư mục logic đang PROPFIND.
@@ -214,14 +313,21 @@ func writeMultistatus(w http.ResponseWriter, logger *slog.Logger, ms multistatus
 // không gian files/<user>/... là ẢO — dựng từ logical_path trong DB, không cần
 // thư mục vật lý. Nếu DB chưa có gì khớp, đây vẫn là collection rỗng hợp lệ (M1)
 // để app chấp nhận thư mục đích trước khi upload.
-func dirResponse(href string) davResponse {
+func dirResponse(logical, etag string) davResponse {
+	var zero int64
+	id := dirFileID(logical)
 	return davResponse{
-		Href: href,
+		Href: davHref(logical, true),
 		Propstat: davPropstat{
 			Prop: davProp{
+				DisplayName:  path.Base(logical),
 				ResourceType: &resourceType{Collection: &struct{}{}},
 				LastModified: time.Now().UTC().Format(http.TimeFormat),
-				ETag:         fmt.Sprintf("%q", "dir"),
+				ETag:         fmt.Sprintf("%q", etag),
+				ID:           ocID(id),
+				FileID:       strconv.FormatInt(id, 10),
+				Permissions:  "RGDNVCK",
+				Size:         &zero,
 			},
 			Status: "HTTP/1.1 200 OK",
 		},
@@ -231,15 +337,30 @@ func dirResponse(href string) davResponse {
 // responseForPhoto dựng davResponse cho một file từ bản ghi DB (không stat đĩa).
 func (h *Handler) responseForPhoto(href string, ph *store.Photo) davResponse {
 	size := ph.Size
+	name := ph.OriginalName
+	if ph.LogicalPath != "" {
+		name = path.Base(ph.LogicalPath)
+	}
+	hasPreview := "false"
+	if h.hasPreview != nil && h.hasPreview(ph.MIME) && ph.Width >= 0 {
+		hasPreview = "true"
+	}
 	return davResponse{
 		Href: href,
 		Propstat: davPropstat{
 			Prop: davProp{
+				DisplayName:   name,
 				ResourceType:  &resourceType{},
 				ContentLength: &size,
 				ContentType:   ph.MIME,
 				LastModified:  ph.TakenAt.UTC().Format(http.TimeFormat),
 				ETag:          fmt.Sprintf("%q", etagOfHash(ph.SHA256)),
+				ID:            ocID(ph.ID),
+				FileID:        strconv.FormatInt(ph.ID, 10),
+				Permissions:   "RGDNVW",
+				Size:          &size,
+				HasPreview:    hasPreview,
+				UploadTime:    ph.UploadedAt.Unix(),
 			},
 			Status: "HTTP/1.1 200 OK",
 		},
