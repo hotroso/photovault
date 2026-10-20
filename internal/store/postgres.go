@@ -107,8 +107,15 @@ CREATE INDEX IF NOT EXISTS photos_active_taken_idx ON photos (taken_at DESC, id 
 
 // UpsertPhoto ghi hoặc cập nhật một bản ghi ảnh theo rel_path.
 func (p *Postgres) UpsertPhoto(ctx context.Context, ph Photo) error {
+	_, err := p.UpsertPhotoID(ctx, ph)
+	return err
+}
+
+// UpsertPhotoID giống UpsertPhoto nhưng trả id của bản ghi (0 nếu PG chưa cấu
+// hình). id được trả cho app qua header OC-FileId sau khi upload.
+func (p *Postgres) UpsertPhotoID(ctx context.Context, ph Photo) (int64, error) {
 	if !p.enabled() {
-		return nil
+		return 0, nil
 	}
 	const q = `
 INSERT INTO photos (rel_path, original_name, size, sha256, taken_at, mime, is_trash, dup_of, logical_path, uploaded_at)
@@ -122,10 +129,12 @@ ON CONFLICT (rel_path) DO UPDATE SET
     is_trash      = EXCLUDED.is_trash,
     dup_of        = EXCLUDED.dup_of,
     logical_path  = EXCLUDED.logical_path,
-    uploaded_at   = now();
+    uploaded_at   = now()
+RETURNING id;
 `
-	_, err := p.pool.Exec(ctx, q, ph.RelPath, ph.OriginalName, ph.Size, ph.SHA256, ph.TakenAt, ph.MIME, ph.IsTrash, ph.DupOf, ph.LogicalPath)
-	return err
+	var id int64
+	err := p.pool.QueryRow(ctx, q, ph.RelPath, ph.OriginalName, ph.Size, ph.SHA256, ph.TakenAt, ph.MIME, ph.IsTrash, ph.DupOf, ph.LogicalPath).Scan(&id)
+	return id, err
 }
 
 // GetByRelPath trả bản ghi theo đường dẫn tương đối (dùng để chống trùng).

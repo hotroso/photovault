@@ -404,7 +404,7 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 		return
 	}
 
-	res, _, err := h.storeWithDedup(r.Context(), staged, path.Base(rel), mtime, rel)
+	res, _, fileID, err := h.storeWithDedup(r.Context(), staged, path.Base(rel), mtime, rel)
 	if err != nil {
 		// storeWithDedup đã RemoveStaged ở nhánh lỗi finalize.
 		h.logger.Error("PUT lưu lỗi", "rel", rel, "err", err)
@@ -412,8 +412,7 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 		return
 	}
 
-	w.Header().Set("OC-ETag", fmt.Sprintf("%q", res.SHA256[:16]))
-	w.Header().Set("ETag", fmt.Sprintf("%q", res.SHA256[:16]))
+	setUploadHeaders(w, fileID, res.SHA256)
 	w.WriteHeader(http.StatusCreated) // 201
 	h.logger.Info("đã lưu ảnh", "rel", res.RelPath, "size", res.Size, "sha256", res.SHA256[:12])
 }
@@ -422,7 +421,9 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 // đưa vào photos/ (bản gốc) hay recyclebin/ (bản trùng, is_trash=true, dup_of=gốc).
 // Luôn trả về *Result khi không lỗi; dup=true nếu là bản trùng. Dù dedup hay
 // không, một lỗi DB tra cứu KHÔNG bao giờ chặn backup — khi đó coi như không trùng.
-func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResult, baseName string, mtime time.Time, logicalPath string) (*storage.Result, bool, error) {
+// fileID là id trả cho app (OC-FileId): với bản trùng là id BẢN GỐC, vì đó là
+// file app sẽ thấy khi duyệt server.
+func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResult, baseName string, mtime time.Time, logicalPath string) (res *storage.Result, dup bool, fileID int64, err error) {
 	h.dedupMu.Lock()
 	defer h.dedupMu.Unlock()
 
@@ -436,21 +437,21 @@ func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResul
 		res, ferr := h.store.FinalizeStaged(staged.TempRel, "recyclebin", baseName, staged.SHA256, mtime)
 		if ferr != nil {
 			_ = h.store.RemoveStaged(staged.TempRel)
-			return nil, false, ferr
+			return nil, false, 0, ferr
 		}
 		dupOf := existing.ID
 		h.indexPhoto(ctx, res, mtime, true, &dupOf, logicalPath)
 		h.logger.Warn("phát hiện trùng → đưa vào thùng rác", "hash", staged.SHA256[:12], "rel", res.RelPath, "gốc", existing.RelPath)
-		return res, true, nil
+		return res, true, existing.ID, nil
 	}
 
 	res, ferr := h.store.FinalizeStaged(staged.TempRel, "photos", baseName, staged.SHA256, mtime)
 	if ferr != nil {
 		_ = h.store.RemoveStaged(staged.TempRel)
-		return nil, false, ferr
+		return nil, false, 0, ferr
 	}
-	h.indexPhoto(ctx, res, mtime, false, nil, logicalPath)
-	return res, false, nil
+	id := h.indexPhoto(ctx, res, mtime, false, nil, logicalPath)
+	return res, false, id, nil
 }
 
 // ---- MOVE (đổi tên / di chuyển trong files/) ----
@@ -536,7 +537,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request, rel string) {
 // indexPhoto ghi bản ghi vào Postgres (no-op nếu PG chưa cấu hình).
 // isTrash/dupOf đánh dấu bản trùng đã bị đưa vào thùng rác.
 // logicalPath là đường dẫn app nhìn thấy (M2), ví dụ "me/Photos/IMG_0001.jpg".
-func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime time.Time, isTrash bool, dupOf *int64, logicalPath string) {
+func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime time.Time, isTrash bool, dupOf *int64, logicalPath string) int64 {
 	taken := mtime
 	if taken.IsZero() {
 		taken = time.Now()
@@ -558,7 +559,24 @@ func (h *Handler) indexPhoto(ctx context.Context, res *storage.Result, mtime tim
 		DupOf:        dupOf,
 		LogicalPath:  logicalPath,
 	}
-	if err := h.pg.UpsertPhoto(ctx, ph); err != nil {
+	id, err := h.pg.UpsertPhotoID(ctx, ph)
+	if err != nil {
 		h.logger.Warn("index Postgres thất bại", "rel", res.RelPath, "err", err)
+	}
+	return id
+}
+
+// setUploadHeaders ghi các header Nextcloud trả sau một upload thành công.
+//
+// QUAN TRỌNG: app iOS chỉ coi upload là thành công khi có OC-FileId. Thiếu nó,
+// app bỏ qua bước "đã upload" — không ghi nhận auto-upload (nên lần sau
+// upload lại từ đầu) và không bao giờ xoá ảnh khỏi máy ("xoá sau khi tải lên").
+func setUploadHeaders(w http.ResponseWriter, fileID int64, sha string) {
+	etag := fmt.Sprintf("%q", etagOfHash(sha))
+	w.Header().Set("OC-ETag", etag)
+	w.Header().Set("ETag", etag)
+	if fileID > 0 {
+		w.Header().Set("OC-FileId", ocID(fileID))
+		w.Header().Set("X-NC-Permissions", "RGDNVW")
 	}
 }

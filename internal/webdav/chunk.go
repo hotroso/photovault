@@ -148,14 +148,14 @@ func (h *Handler) uploadAssemble(w http.ResponseWriter, r *http.Request, rel str
 	// Dọn thư mục chunk tạm.
 	_ = h.store.Remove(chunkDirRel(uuidRel))
 
-	res, _, err := h.storeWithDedup(r.Context(), staged, filepath.Base(dest), mtime, dest)
+	res, _, fileID, err := h.storeWithDedup(r.Context(), staged, filepath.Base(dest), mtime, dest)
 	if err != nil {
 		h.logger.Error("lưu file ghép lỗi", "dest", dest, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("OC-ETag", fmt.Sprintf("%q", res.SHA256[:16]))
+	setUploadHeaders(w, fileID, res.SHA256)
 	w.WriteHeader(http.StatusCreated) // 201
 	h.logger.Info("đã ghép & lưu video/ảnh lớn", "dest", res.RelPath, "size", res.Size, "chunks", len(names), "sha256", res.SHA256[:12])
 }
