@@ -13,12 +13,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Storage quản lý một thư mục gốc chứa dữ liệu raw.
 type Storage struct {
 	root string
+
+	// placeMu khoá bước "chọn tên + rename vào đích". Nếu không khoá, hai file
+	// cùng tên khác nội dung đặt song song có thể cùng thấy tên còn trống, và
+	// os.Rename của bên sau sẽ GHI ĐÈ file của bên trước.
+	placeMu sync.Mutex
 }
 
 // New tạo Storage với thư mục gốc (DataDir).
@@ -202,7 +208,8 @@ func yyyymmFromTime(t time.Time) string {
 //   - Nếu file cùng tên có nội dung GIỐNG HỆT → tái dùng tên đó (idempotent).
 //
 // So sánh nội dung rẻ trước: so size, chỉ hash file hiện có khi size khớp.
-func (s *Storage) collisionSafeName(destDirAbs, baseName, fullHash string) (string, error) {
+// Caller PHẢI giữ s.placeMu từ lúc gọi hàm này tới khi rename xong.
+func (s *Storage) collisionSafeName(destDirAbs, baseName, fullHash string, size int64) (string, error) {
 	ext := filepath.Ext(baseName)
 	stem := strings.TrimSuffix(baseName, ext)
 
@@ -223,7 +230,7 @@ func (s *Storage) collisionSafeName(destDirAbs, baseName, fullHash string) (stri
 		if err != nil {
 			return "", fmt.Errorf("kiểm tra file đích: %w", err)
 		}
-		same, err := sameContent(candAbs, fi.Size(), fullHash)
+		same, err := sameContent(candAbs, fi.Size(), size, fullHash)
 		if err != nil {
 			return "", err
 		}
@@ -237,7 +244,11 @@ func (s *Storage) collisionSafeName(destDirAbs, baseName, fullHash string) (stri
 
 // sameContent cho biết file tại abs có nội dung giống hash hay không. So size
 // trước (rẻ), chỉ hash file khi size khớp.
-func sameContent(abs string, existingSize int64, fullHash string) (bool, error) {
+func sameContent(abs string, existingSize, wantSize int64, fullHash string) (bool, error) {
+	// Khác size thì chắc chắn khác nội dung — khỏi đọc file (quan trọng với video lớn).
+	if existingSize != wantSize {
+		return false, nil
+	}
 	f, err := os.Open(abs)
 	if err != nil {
 		return false, fmt.Errorf("mở file đích: %w", err)
@@ -270,24 +281,36 @@ func (s *Storage) FinalizeStaged(tempRel, destDir, baseName, fullHash string, mt
 		return nil, fmt.Errorf("tạo thư mục đích: %w", err)
 	}
 
-	name, err := s.collisionSafeName(destDirAbs, baseName, fullHash)
+	tfi, err := os.Stat(tempAbs)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("stat file staging: %w", err)
 	}
 
-	relPath := filepath.ToSlash(filepath.Join(relDir, name))
-	abs, err := s.safeJoin(relPath)
+	// Chọn tên + rename là một khối nguyên tử (xem placeMu).
+	abs, err := func() (string, error) {
+		s.placeMu.Lock()
+		defer s.placeMu.Unlock()
+
+		name, err := s.collisionSafeName(destDirAbs, baseName, fullHash, tfi.Size())
+		if err != nil {
+			return "", err
+		}
+		abs, err := s.safeJoin(filepath.ToSlash(filepath.Join(relDir, name)))
+		if err != nil {
+			return "", err
+		}
+		// Nếu tái dùng tên có nội dung trùng (idempotent), file đích đã tồn tại và
+		// staging dư thừa → xoá staging, không rename đè.
+		if _, statErr := os.Stat(abs); statErr == nil {
+			_ = os.Remove(tempAbs)
+		} else if err := os.Rename(tempAbs, abs); err != nil {
+			_ = os.Remove(tempAbs)
+			return "", fmt.Errorf("rename vào đích: %w", err)
+		}
+		return abs, nil
+	}()
 	if err != nil {
 		return nil, err
-	}
-
-	// Nếu tái dùng tên có nội dung trùng (idempotent), file đích đã tồn tại và
-	// staging dư thừa → xoá staging, không rename đè.
-	if _, statErr := os.Stat(abs); statErr == nil {
-		_ = os.Remove(tempAbs)
-	} else if err := os.Rename(tempAbs, abs); err != nil {
-		_ = os.Remove(tempAbs)
-		return nil, fmt.Errorf("rename vào đích: %w", err)
 	}
 
 	if !mtime.IsZero() {
@@ -328,7 +351,7 @@ func (s *Storage) MoveCollisionSafe(srcRel, destDir string, mtime time.Time) (*R
 	baseName := filepath.Base(srcRel)
 
 	// Hash file nguồn để collisionSafeName có thể so sánh nội dung khi trùng tên.
-	fullHash, _, err := hashFileAt(srcAbs)
+	fullHash, srcSize, err := hashFileAt(srcAbs)
 	if err != nil {
 		return nil, err
 	}
@@ -342,22 +365,29 @@ func (s *Storage) MoveCollisionSafe(srcRel, destDir string, mtime time.Time) (*R
 		return nil, fmt.Errorf("tạo thư mục đích: %w", err)
 	}
 
-	name, err := s.collisionSafeName(destDirAbs, baseName, fullHash)
+	// Chọn tên + rename là một khối nguyên tử (xem placeMu).
+	abs, err := func() (string, error) {
+		s.placeMu.Lock()
+		defer s.placeMu.Unlock()
+
+		name, err := s.collisionSafeName(destDirAbs, baseName, fullHash, srcSize)
+		if err != nil {
+			return "", err
+		}
+		abs, err := s.safeJoin(filepath.ToSlash(filepath.Join(relDir, name)))
+		if err != nil {
+			return "", err
+		}
+		// Nếu đích đã tồn tại với nội dung trùng (idempotent) → xoá nguồn, không rename đè.
+		if _, statErr := os.Stat(abs); statErr == nil {
+			_ = os.Remove(srcAbs)
+		} else if err := os.Rename(srcAbs, abs); err != nil {
+			return "", fmt.Errorf("rename vào đích: %w", err)
+		}
+		return abs, nil
+	}()
 	if err != nil {
 		return nil, err
-	}
-
-	relPath := filepath.ToSlash(filepath.Join(relDir, name))
-	abs, err := s.safeJoin(relPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// Nếu đích đã tồn tại với nội dung trùng (idempotent) → xoá nguồn, không rename đè.
-	if _, statErr := os.Stat(abs); statErr == nil {
-		_ = os.Remove(srcAbs)
-	} else if err := os.Rename(srcAbs, abs); err != nil {
-		return nil, fmt.Errorf("rename vào đích: %w", err)
 	}
 
 	if !mtime.IsZero() {
@@ -412,6 +442,83 @@ func hashFileAt(abs string) (string, int64, error) {
 		return "", 0, fmt.Errorf("hash file nguồn: %w", err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// CleanupStale xoá dữ liệu tạm bị bỏ dở lâu hơn maxAge:
+//   - .uploads/<user>/<uuid>/: phiên chunked upload mà app huỷ nhưng không gửi DELETE.
+//   - .staging/*.part: file staging mồ côi (vd server bị kill giữa lúc ghi).
+//
+// "Lần hoạt động cuối" của một phiên chunk là mtime mới nhất trong thư mục đó,
+// nên phiên đang upload (vừa ghi chunk) không bị xoá. Trả số mục đã xoá.
+func (s *Storage) CleanupStale(maxAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+
+	uploadsAbs := filepath.Join(s.root, ".uploads")
+	users, err := os.ReadDir(uploadsAbs)
+	if err != nil && !os.IsNotExist(err) {
+		return removed, err
+	}
+	for _, u := range users {
+		if !u.IsDir() {
+			continue
+		}
+		userAbs := filepath.Join(uploadsAbs, u.Name())
+		sessions, err := os.ReadDir(userAbs)
+		if err != nil {
+			continue
+		}
+		for _, sess := range sessions {
+			if !sess.IsDir() {
+				continue
+			}
+			sessAbs := filepath.Join(userAbs, sess.Name())
+			if latestModTime(sessAbs).Before(cutoff) {
+				if err := os.RemoveAll(sessAbs); err == nil {
+					removed++
+				}
+			}
+		}
+	}
+
+	stagingAbs := filepath.Join(s.root, ".staging")
+	files, err := os.ReadDir(stagingAbs)
+	if err != nil && !os.IsNotExist(err) {
+		return removed, err
+	}
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		info, err := f.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(filepath.Join(stagingAbs, f.Name())); err == nil {
+				removed++
+			}
+		}
+	}
+	return removed, nil
+}
+
+// latestModTime trả mtime mới nhất của thư mục dir và các entry trực tiếp trong nó.
+func latestModTime(dir string) time.Time {
+	var latest time.Time
+	if fi, err := os.Stat(dir); err == nil {
+		latest = fi.ModTime()
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return latest
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
 }
 
 // Mkdir tạo một thư mục (cho WebDAV MKCOL).

@@ -14,10 +14,11 @@ import (
 // ServeUploads điều phối chunked upload v2 trên /remote.php/dav/uploads/<user>/...
 //
 // Luồng (theo tài liệu Nextcloud):
-//   MKCOL  /uploads/<user>/<uuid>            (+ Destination)  → tạo thư mục chunk
-//   PUT    /uploads/<user>/<uuid>/00001      (+ Destination)  → ghi từng chunk
-//   MOVE   /uploads/<user>/<uuid>/.file      (+ Destination)  → ghép → file đích
-//   DELETE /uploads/<user>/<uuid>                              → huỷ
+//
+//	MKCOL  /uploads/<user>/<uuid>            (+ Destination)  → tạo thư mục chunk
+//	PUT    /uploads/<user>/<uuid>/00001      (+ Destination)  → ghi từng chunk
+//	MOVE   /uploads/<user>/<uuid>/.file      (+ Destination)  → ghép → file đích
+//	DELETE /uploads/<user>/<uuid>                              → huỷ
 func (h *Handler) ServeUploads(w http.ResponseWriter, r *http.Request) {
 	rel := h.relFromUploads(r.URL.Path) // ví dụ "<user>/<uuid>" hoặc "<user>/<uuid>/00001"
 	switch r.Method {

@@ -15,6 +15,7 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/local/photovault/internal/config"
 	"github.com/local/photovault/internal/server"
@@ -56,6 +57,7 @@ func main() {
 	defer rd.Close()
 
 	st := storage.New(cfg.DataDir)
+	go runJanitor(st, logger)
 
 	logger.Info("khởi động photovault",
 		"user", cfg.User,
@@ -75,6 +77,20 @@ func main() {
 	if err := server.Run(deps); err != nil {
 		logger.Error("server dừng với lỗi", "err", err)
 		os.Exit(1)
+	}
+}
+
+// runJanitor dọn chunk upload bị bỏ dở và file staging mồ côi quá 24h — chạy lúc
+// khởi động rồi mỗi giờ một lần. 24h khớp thời hạn phiên chunked upload của Nextcloud.
+func runJanitor(st *storage.Storage, logger *slog.Logger) {
+	const maxAge = 24 * time.Hour
+	for {
+		if n, err := st.CleanupStale(maxAge); err != nil {
+			logger.Warn("dọn file tạm lỗi", "err", err)
+		} else if n > 0 {
+			logger.Info("đã dọn file tạm bị bỏ dở", "so_muc", n)
+		}
+		time.Sleep(time.Hour)
 	}
 }
 

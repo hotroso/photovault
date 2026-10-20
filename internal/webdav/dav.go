@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/local/photovault/internal/config"
@@ -27,6 +28,12 @@ type Handler struct {
 	pg      *store.Postgres
 	logger  *slog.Logger
 	filesNS string // tiền tố "/remote.php/dav/files/<user>"
+
+	// dedupMu tuần tự hoá bước "tra hash → đặt file → ghi index". Không khoá thì
+	// hai file giống hệt upload song song (app chạy tới 5 luồng) cùng thấy hash
+	// chưa tồn tại và cả hai vào photos/. Bước stream dữ liệu (StageTemp) nằm
+	// NGOÀI khoá nên upload vẫn song song; phần trong khoá chỉ vài mili-giây.
+	dedupMu sync.Mutex
 }
 
 // NewHandler tạo WebDAV handler.
@@ -76,15 +83,15 @@ func (h *Handler) relFromFiles(urlPath string) string {
 // ---- PROPFIND ----
 
 type multistatus struct {
-	XMLName   xml.Name     `xml:"d:multistatus"`
-	XMLNSD    string       `xml:"xmlns:d,attr"`
-	XMLNSOC   string       `xml:"xmlns:oc,attr"`
-	XMLNSNC   string       `xml:"xmlns:nc,attr"`
+	XMLName   xml.Name      `xml:"d:multistatus"`
+	XMLNSD    string        `xml:"xmlns:d,attr"`
+	XMLNSOC   string        `xml:"xmlns:oc,attr"`
+	XMLNSNC   string        `xml:"xmlns:nc,attr"`
 	Responses []davResponse `xml:"d:response"`
 }
 
 type davResponse struct {
-	Href     string     `xml:"d:href"`
+	Href     string      `xml:"d:href"`
 	Propstat davPropstat `xml:"d:propstat"`
 }
 
@@ -295,6 +302,9 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, rel string) {
 // Luôn trả về *Result khi không lỗi; dup=true nếu là bản trùng. Dù dedup hay
 // không, một lỗi DB tra cứu KHÔNG bao giờ chặn backup — khi đó coi như không trùng.
 func (h *Handler) storeWithDedup(ctx context.Context, staged *storage.StageResult, baseName string, mtime time.Time, logicalPath string) (*storage.Result, bool, error) {
+	h.dedupMu.Lock()
+	defer h.dedupMu.Unlock()
+
 	existing, err := h.pg.GetBySHA256(ctx, staged.SHA256)
 	if err != nil {
 		h.logger.Warn("tra cứu hash thất bại, coi như không trùng", "hash", staged.SHA256[:12], "err", err)
