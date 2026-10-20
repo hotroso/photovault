@@ -1,21 +1,17 @@
-# Caddy đặt TRƯỚC server Go để lo TLS trên Ubuntu LAN.
+# Caddy đặt TRƯỚC server Go, chỉ làm reverse proxy HTTP thuần trong LAN (KHÔNG TLS).
 #
-# Chạy:  caddy run --config Caddyfile
+# Đã bỏ HTTPS: cert tự ký của Caddy làm app Nextcloud iOS thỉnh thoảng hỏi lại
+# tin cậy cert, mất phiên và phải đồng bộ lại từ đầu.
 #
-# Với IP LAN, Caddy dùng internal CA (cert tự ký của chính Caddy). Sau khi chạy
-# lần đầu, export root CA của Caddy và cài + tin cậy nó trên iPhone:
-#   - Root CA nằm ở: ~/.local/share/caddy/pki/authorities/local/root.crt
-#     (nếu chạy bằng systemd service "caddy": /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt)
-#   - AirDrop/email file đó về iPhone, cài profile, rồi bật trust đầy đủ ở
-#     Settings > General > About > Certificate Trust Settings.
+# Cài:  sudo cp Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 
 {
-	# Dùng CA nội bộ của Caddy cho địa chỉ IP (không xin được Let's Encrypt cho IP LAN).
-	local_certs
+	# Không tự cấp cert, không tự chuyển HTTP → HTTPS.
+	auto_https off
 }
 
-# Cổng 8081 là cổng công khai iPhone trỏ vào (khớp APP_PUBLIC_URL).
-https://192.168.1.55:8081 {
+# Cổng 8081 là cổng iPhone trỏ vào (khớp APP_PUBLIC_URL=http://192.168.1.55:8081).
+http://192.168.1.55:8081 {
 	# Server Go chạy HTTP ở localhost:8090 (khớp APP_LISTEN_ADDR trong .env).
 	reverse_proxy 127.0.0.1:8090
 
