@@ -1,0 +1,39 @@
+[Unit]
+Description=PhotoVault - Nextcloud-compatible photo backup server
+Documentation=https://github.com/hotroso/photovault
+# Phụ thuộc Postgres + Redis chạy trong Docker (Immich). Đợi mạng và docker sẵn sàng.
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=sokoda
+Group=sokoda
+
+WorkingDirectory=/home/sokoda/projects/photovault
+# Server tự đọc .env ở WorkingDirectory; EnvironmentFile nạp thêm để chắc chắn.
+EnvironmentFile=/home/sokoda/projects/photovault/.env
+ExecStart=/home/sokoda/projects/photovault/bin/pv-server
+
+# Tự khởi động lại khi crash; đợi 5s giữa các lần thử.
+Restart=on-failure
+RestartSec=5
+
+# Dọn dẹp êm khi stop/restart.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Hardening nhẹ (không ảnh hưởng đọc/ghi data dir dưới /media/DATA).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelTunables=true
+
+# Log ra journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=photovault
+
+[Install]
+WantedBy=multi-user.target
